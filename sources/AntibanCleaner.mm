@@ -3,12 +3,27 @@
 #import <objc/runtime.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MCM private API — разрешено entitlement com.apple.private.MobileContainerManager.allowed
+//  MCM private API — loaded at runtime via dlsym so the linker never sees it.
+//  entitlement com.apple.private.MobileContainerManager.allowed already present.
 // ─────────────────────────────────────────────────────────────────────────────
-extern "C" NSString * _Nullable MCMActivateContainerPath(int type,
-                                                         NSString *bundleID,
-                                                         BOOL activate,
-                                                         NSString * _Nullable __autoreleasing * _Nullable error);
+typedef NSString * (*MCMActivateContainerPathFn)(int type,
+                                                 NSString *bundleID,
+                                                 BOOL activate,
+                                                 NSString * __autoreleasing *error);
+
+static MCMActivateContainerPathFn _MCMActivateContainerPath(void) {
+    static MCMActivateContainerPathFn fn = NULL;
+    static dispatch_once_t token;
+    dispatch_once(&token, ^{
+        void *handle = dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
+                              RTLD_NOW | RTLD_NOLOAD);
+        if (!handle) handle = dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
+                                     RTLD_NOW);
+        if (handle) fn = (MCMActivateContainerPathFn)dlsym(handle, "MCMActivateContainerPath");
+        if (!fn) NSLog(@"[ANTIBAN] dlsym MCMActivateContainerPath failed: %s", dlerror());
+    });
+    return fn;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Supported game bundle IDs — FreeFire TH and MAX
@@ -22,13 +37,18 @@ static NSArray<NSString *> *supportedBundleIDs(void) {
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString * _Nullable resolveContainerPath(NSString *bundleID) {
     // 1. MCM (fastest, uses the entitlement we already have)
-    NSString *mcmError = nil;
-    NSString *path = MCMActivateContainerPath(2, bundleID, NO, &mcmError);
-    if (path.length > 0) {
-        NSLog(@"[ANTIBAN] MCM resolved %@ → %@", bundleID, path);
-        return path;
+    MCMActivateContainerPathFn mcmFn = _MCMActivateContainerPath();
+    if (mcmFn) {
+        NSString *mcmError = nil;
+        NSString *path = mcmFn(2, bundleID, NO, &mcmError);
+        if (path.length > 0) {
+            NSLog(@"[ANTIBAN] MCM resolved %@ → %@", bundleID, path);
+            return path;
+        }
+        NSLog(@"[ANTIBAN] MCM failed for %@: %@. Falling back to metadata scan.", bundleID, mcmError);
+    } else {
+        NSLog(@"[ANTIBAN] MCM unavailable — going to metadata scan.");
     }
-    NSLog(@"[ANTIBAN] MCM failed for %@: %@. Falling back to metadata scan.", bundleID, mcmError);
 
     // 2. Metadata scan — iterate /var/mobile/Containers/Data/Application
     //    reading the .com.apple.mobile_container_manager.metadata.plist in each UUID dir
