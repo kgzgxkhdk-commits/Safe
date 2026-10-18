@@ -1,58 +1,71 @@
-name: Extract ZIP to Root
+name: Build FFExternal
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - '*.zip'
-
-permissions:
-  contents: write
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  extract:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: macos-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          submodules: recursive
 
-      - name: Extract ZIP to repository root
+      - name: Install Theos dependencies
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
+          brew install ldid xz
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ZIP file not found"
-            exit 1
-          fi
+      - name: Setup Theos
+        uses: actions/cache@v4
+        id: theos-cache
+        with:
+          path: theos
+          key: theos-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
 
-          mkdir -p /tmp/project_extract
-          unzip -oq "$ZIP_FILE" -d /tmp/project_extract
-
-          SOURCE_DIR="/tmp/project_extract"
-
-          if [ "$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -d "$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -type d)" ]; then
-            SOURCE_DIR="$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -type d)"
-          fi
-
-          cp -a "$SOURCE_DIR"/. .
-
-          rm -f "$ZIP_FILE"
-          rm -rf /tmp/project_extract
-
-      - name: Commit extracted files
+      - name: Clone Theos (if not cached)
+        if: steps.theos-cache.outputs.cache-hit != 'true'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone --recursive https://github.com/theos/theos.git theos
+          git -C theos submodule update --init --recursive
 
-          git add -A
+      - name: Download iOS SDK
+        uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: theos/sdks
+          key: ios-sdk-16.5
 
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-            exit 0
-          fi
+      - name: Fetch iOS 16.5 SDK (if not cached)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -LO https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz
+          tar -xf iPhoneOS16.5.sdk.tar.xz -C theos/sdks/
+          rm iPhoneOS16.5.sdk.tar.xz
 
-          git commit -m "Extract project ZIP to repository root"
-          git push
+      - name: Set THEOS env
+        run: echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          make package FINALPACKAGE=1 DEBUG=0 -j$(sysctl -n hw.logicalcpu)
+
+      - name: Upload .tipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FFExternal
+          path: packages/*.tipa
+          retention-days: 30
+
+      - name: Create Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*.tipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
