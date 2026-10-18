@@ -36,6 +36,7 @@ static const CFTimeInterval kAutoExitTimeout = 30.0; // 30 giây
 @property (nonatomic, strong) UISwitch *hudSwitch;
 @property (nonatomic, strong) UISwitch *autoCleanSwitch;
 @property (nonatomic, strong) UIButton *telegramButton;
+@property (nonatomic, strong) UIButton *dnsButton;
 @property (nonatomic, strong) CAGradientLayer *backgroundGradient;
 @property (nonatomic, strong) NSTimer *pollTimer;
 
@@ -336,6 +337,37 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     telegramArrow.tag = 1007;
     [_telegramButton addSubview:telegramArrow];
 
+    // ── NextDNS install button ─────────────────────────────────────────────
+    _dnsButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _dnsButton.backgroundColor = [UIColor colorWithWhite:1.0f alpha:0.035f];
+    _dnsButton.layer.cornerRadius = 16.0f;
+    _dnsButton.layer.borderWidth = 1.0f;
+    _dnsButton.layer.borderColor = [UIColor colorWithRed:0.37f green:0.57f blue:0.87f alpha:0.25f].CGColor;
+    [_dnsButton addTarget:self action:@selector(installNextDNS) forControlEvents:UIControlEventTouchUpInside];
+    [_contentView addSubview:_dnsButton];
+
+    UILabel *dnsKicker = [[UILabel alloc] initWithFrame:CGRectZero];
+    dnsKicker.text = @"ANTI-TRACKING DNS PROFILE";
+    dnsKicker.textColor = muted;
+    dnsKicker.font = [UIFont monospacedSystemFontOfSize:8.0f weight:UIFontWeightMedium];
+    dnsKicker.tag = 2001;
+    [_dnsButton addSubview:dnsKicker];
+
+    UILabel *dnsTitle = [[UILabel alloc] initWithFrame:CGRectZero];
+    dnsTitle.text = @"Install NextDNS";
+    dnsTitle.textColor = [UIColor colorWithWhite:0.96f alpha:1.0f];
+    dnsTitle.font = [UIFont systemFontOfSize:13.0f weight:UIFontWeightSemibold];
+    dnsTitle.tag = 2002;
+    [_dnsButton addSubview:dnsTitle];
+
+    UIImageView *dnsArrow = [[UIImageView alloc] initWithFrame:CGRectZero];
+    dnsArrow.image = [UIImage systemImageNamed:@"arrow.down.circle"];
+    dnsArrow.tintColor = [UIColor colorWithRed:0.37f green:0.57f blue:0.87f alpha:1.0f];
+    dnsArrow.contentMode = UIViewContentModeScaleAspectFit;
+    dnsArrow.tag = 2003;
+    [_dnsButton addSubview:dnsArrow];
+    // ──────────────────────────────────────────────────────────────────────────
+
     _footerLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _footerLabel.text = @"FF EXTERNAL     •     GAME 1.132.1";
     _footerLabel.textAlignment = NSTextAlignmentCenter;
@@ -444,7 +476,7 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     _pageScrollView.frame = CGRectMake(0, insets.top, viewWidth, viewportHeight);
 
     CGFloat contentWidth = MIN(MAX(0.0f, viewWidth - 40.0f), 560.0f);
-    CGFloat contentHeight = 666.0f;
+    CGFloat contentHeight = 750.0f;
     CGFloat contentX = (viewWidth - contentWidth) * 0.5f;
     _contentView.frame = CGRectMake(contentX, 0, contentWidth, contentHeight);
     _pageScrollView.contentSize = CGSizeMake(viewWidth, contentHeight);
@@ -482,7 +514,13 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     ((UILabel *)[_telegramButton viewWithTag:1005]).frame = CGRectMake(17, 13, contentWidth - 70, 13);
     ((UILabel *)[_telegramButton viewWithTag:1006]).frame = CGRectMake(17, 31, contentWidth - 70, 21);
     ((UIImageView *)[_telegramButton viewWithTag:1007]).frame = CGRectMake(contentWidth - 39, 25, 16, 16);
-    _footerLabel.frame = CGRectMake(0, 627, contentWidth, 18);
+
+    _dnsButton.frame = CGRectMake(0, 620, contentWidth, 68);
+    ((UILabel *)[_dnsButton viewWithTag:2001]).frame = CGRectMake(17, 13, contentWidth - 70, 13);
+    ((UILabel *)[_dnsButton viewWithTag:2002]).frame = CGRectMake(17, 31, contentWidth - 70, 21);
+    ((UIImageView *)[_dnsButton viewWithTag:2003]).frame = CGRectMake(contentWidth - 39, 25, 16, 16);
+
+    _footerLabel.frame = CGRectMake(0, 700, contentWidth, 18);
 }
 
 #pragma mark - Dealloc
@@ -590,18 +628,12 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     BOOL game = gameNow || (_gameMissingStreak < 3);
 
     // ── ANTIBAN AUTO-TRIGGER ─────────────────────────────────────────────────
-    // _lastGameRunning starts as NO → первый цикл где game detected = startLoop.
-    // Когда game пропала (game == NO после grace) = stopLoop.
+    // Game edge: NOT running → running = start vnode watchers.
+    // running → NOT running = stop watchers + final clean pass.
     if (game && !_lastGameRunning) {
-        NSLog(@"[ANTIBAN] Game appeared — starting antiban loop");
-        [[AntibanCleaner shared] startLoop];
+        [[AntibanCleaner shared] startWatching];
     } else if (!game && _lastGameRunning) {
-        NSLog(@"[ANTIBAN] Game gone — stopping antiban loop");
-        [[AntibanCleaner shared] stopLoop];
-        // Финальный разовый прогон при выходе из матча
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            [[AntibanCleaner shared] cleanOnce];
-        });
+        [[AntibanCleaner shared] stopWatching];
     }
     _lastGameRunning = game;
     // ─────────────────────────────────────────────────────────────────────────
@@ -645,5 +677,35 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     if (_hudSwitch.on != hud) [_hudSwitch setOn:hud animated:YES];
     if (hud) _pendingHUDEnableUntil = 0;
 }
+
+// ── NextDNS install ────────────────────────────────────────────────────────────
+- (void)installNextDNS {
+    NSURL *bundled = [[NSBundle mainBundle] URLForResource:@"NextDNS_20_1a48d7_"
+                                             withExtension:@"mobileconfig"];
+    if (!bundled) {
+        NSLog(@"[DNS] mobileconfig not found in bundle");
+        return;
+    }
+    NSURL *tmp = [NSURL fileURLWithPath:
+                    [NSTemporaryDirectory()
+                        stringByAppendingPathComponent:@"NextDNS_20_1a48d7_.mobileconfig"]];
+    [[NSFileManager defaultManager] removeItemAtURL:tmp error:nil];
+    if (![[NSFileManager defaultManager] copyItemAtURL:bundled toURL:tmp error:nil]) {
+        NSLog(@"[DNS] copy failed");
+        return;
+    }
+    UIDocumentInteractionController *dic =
+        [UIDocumentInteractionController interactionControllerWithURL:tmp];
+    dic.UTI = @"com.apple.mobileconfig";
+    BOOL shown = [dic presentOpenInMenuFromRect:_dnsButton.frame
+                                        inView:self.view
+                                      animated:YES];
+    if (!shown) {
+        NSURL *prefs = [NSURL URLWithString:@"App-Prefs:General&path=ManagedConfigurationList"];
+        [[UIApplication sharedApplication] openURL:prefs options:@{} completionHandler:nil];
+    }
+    objc_setAssociatedObject(self, "dns_dic", dic, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+// ──────────────────────────────────────────────────────────────────────────────
 
 @end
