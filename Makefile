@@ -12,7 +12,6 @@ APPLICATION_NAME := FFExternal
 
 $(APPLICATION_NAME)_USE_MODULES := 0
 $(APPLICATION_NAME)_FILES += $(wildcard sources/*.mm sources/*.m)
-$(APPLICATION_NAME)_FILES += sources/AntiBanManager.mm
 $(APPLICATION_NAME)_FILES += $(wildcard sources/roothide/*.mm sources/roothide/*.m)
 $(APPLICATION_NAME)_FILES += $(wildcard sources/KIF/*.mm sources/KIF/*.m)
 $(APPLICATION_NAME)_FILES += $(wildcard esp/drawing_view/*.mm)
