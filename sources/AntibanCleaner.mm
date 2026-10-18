@@ -78,7 +78,7 @@ static AntibanResult performClean(void) {
                                                           error:nil];
         for (NSURL *item in docItems) {
             NSString *name = item.lastPathComponent;
-            NSString *lower = name.lowercased;
+            NSString *lower = name.lowercaseString;
 
             // Оставляем patch bytes и antiban decoy файлы (как в proxyapp)
             if ([lower isEqualToString:@"assembly-csharp-patch.bytes"]) continue;
