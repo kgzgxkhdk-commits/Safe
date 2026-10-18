@@ -39,7 +39,7 @@ $(APPLICATION_NAME)_CFLAGS += -DPID_PATH="@\"/var/mobile/Library/Caches/ext.ff.p
 $(APPLICATION_NAME)_CCFLAGS += -std=c++17
 
 # 🛡️ ĐÃ THÊM 'Security' vào đây để sửa triệt để lỗi Linker _SecTrustEvaluate
-$(APPLICATION_NAME)_FRAMEWORKS += CoreGraphics CoreServices QuartzCore IOKit UIKit CoreText Security NetworkExtension
+$(APPLICATION_NAME)_FRAMEWORKS += CoreGraphics CoreServices QuartzCore IOKit UIKit CoreText Security
 
 $(APPLICATION_NAME)_PRIVATE_FRAMEWORKS += BackBoardServices GraphicsServices SpringBoardServices
 $(APPLICATION_NAME)_CODESIGN_FLAGS += -Slayout/entitlements.plist
