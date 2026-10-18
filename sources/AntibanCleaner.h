@@ -8,24 +8,23 @@ typedef struct {
     NSInteger deletedCaches;
 } AntibanResult;
 
-/// Порт cleanAntibanAndTelemetry + continuous loop из proxyapp.
-/// Умеет резолвить контейнер FreeFire через MCMActivateContainerPath
-/// (entitlement com.apple.private.MobileContainerManager.allowed).
+/// Watches game container directories with DISPATCH_SOURCE_TYPE_VNODE.
+/// Fires an immediate clean pass the moment any file appears in a watched dir.
+/// Start when game is detected, stop when game exits.
 @interface AntibanCleaner : NSObject
 
 + (instancetype)shared;
 
-/// Разовая чистка — возвращает результат синхронно на background queue.
+/// One-shot immediate clean, returns result synchronously on background queue.
 - (AntibanResult)cleanOnce;
 
-/// Запускает цикл чистки каждые 10 сек (как в proxyapp).
-/// Вызывается когда game detected (при старте матча).
-- (void)startLoop;
+/// Start fs-level watching. Fires on game process appear.
+- (void)startWatching;
 
-/// Останавливает цикл. Вызывается когда game пропала (выход из матча).
-- (void)stopLoop;
+/// Stop watching + final clean pass. Fires on game process disappear.
+- (void)stopWatching;
 
-@property (nonatomic, readonly) BOOL isLoopRunning;
+@property (nonatomic, readonly) BOOL         isWatching;
 @property (nonatomic, readonly) AntibanResult lastResult;
 
 @end
