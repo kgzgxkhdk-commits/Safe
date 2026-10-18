@@ -1,84 +1,45 @@
 #import "AntibanCleaner.h"
-#import <dlfcn.h>
 #import <objc/runtime.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MCM private API — loaded at runtime via dlsym so the linker never sees it.
-//  entitlement com.apple.private.MobileContainerManager.allowed already present.
-// ─────────────────────────────────────────────────────────────────────────────
-typedef NSString * (*MCMActivateContainerPathFn)(int type,
-                                                 NSString *bundleID,
-                                                 BOOL activate,
-                                                 NSString * __autoreleasing *error);
-
-static MCMActivateContainerPathFn _MCMActivateContainerPath(void) {
-    static MCMActivateContainerPathFn fn = NULL;
-    static dispatch_once_t token;
-    dispatch_once(&token, ^{
-        void *handle = dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
-                              RTLD_NOW | RTLD_NOLOAD);
-        if (!handle) handle = dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
-                                     RTLD_NOW);
-        if (handle) fn = (MCMActivateContainerPathFn)dlsym(handle, "MCMActivateContainerPath");
-        if (!fn) NSLog(@"[ANTIBAN] dlsym MCMActivateContainerPath failed: %s", dlerror());
-    });
-    return fn;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Supported game bundle IDs — FreeFire TH and MAX
+//  Bundle IDs
 // ─────────────────────────────────────────────────────────────────────────────
 static NSArray<NSString *> *supportedBundleIDs(void) {
     return @[ @"com.dts.freefireth", @"com.dts.freefiremax" ];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Resolve container path for a bundle ID via MCM → fallback metadata scan
+//  Resolve container via metadata plist scan.
+//  Works because entitlements include:
+//    com.apple.private.security.no-sandbox
+//    com.apple.private.security.storage.AppDataContainers
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString * _Nullable resolveContainerPath(NSString *bundleID) {
-    // 1. MCM (fastest, uses the entitlement we already have)
-    MCMActivateContainerPathFn mcmFn = _MCMActivateContainerPath();
-    if (mcmFn) {
-        NSString *mcmError = nil;
-        NSString *path = mcmFn(2, bundleID, NO, &mcmError);
-        if (path.length > 0) {
-            NSLog(@"[ANTIBAN] MCM resolved %@ → %@", bundleID, path);
-            return path;
-        }
-        NSLog(@"[ANTIBAN] MCM failed for %@: %@. Falling back to metadata scan.", bundleID, mcmError);
-    } else {
-        NSLog(@"[ANTIBAN] MCM unavailable — going to metadata scan.");
-    }
-
-    // 2. Metadata scan — iterate /var/mobile/Containers/Data/Application
-    //    reading the .com.apple.mobile_container_manager.metadata.plist in each UUID dir
     NSString *appDataRoot = @"/var/mobile/Containers/Data/Application";
-    NSError *fsErr = nil;
+    NSError *err = nil;
     NSArray<NSString *> *uuids = [[NSFileManager defaultManager]
                                     contentsOfDirectoryAtPath:appDataRoot
-                                    error:&fsErr];
-    if (!uuids || fsErr) {
-        NSLog(@"[ANTIBAN] Metadata scan: cannot enumerate %@: %@", appDataRoot, fsErr);
+                                    error:&err];
+    if (!uuids) {
+        NSLog(@"[ANTIBAN] Cannot enumerate %@: %@", appDataRoot, err);
         return nil;
     }
-
     for (NSString *uuid in uuids) {
-        NSString *containerDir = [appDataRoot stringByAppendingPathComponent:uuid];
-        NSString *metaPath = [containerDir
-            stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-        NSString *bid = meta[@"MCMMetadataIdentifier"];
-        if ([bid isEqualToString:bundleID]) {
-            NSLog(@"[ANTIBAN] Metadata scan resolved %@ → %@", bundleID, containerDir);
-            return containerDir;
+        NSString *dir  = [appDataRoot stringByAppendingPathComponent:uuid];
+        NSString *meta = [dir stringByAppendingPathComponent:
+                            @".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:meta];
+        if ([d[@"MCMMetadataIdentifier"] isEqualToString:bundleID]) {
+            NSLog(@"[ANTIBAN] Resolved %@ → %@", bundleID, dir);
+            return dir;
         }
     }
-    NSLog(@"[ANTIBAN] Metadata scan: %@ not found", bundleID);
+    NSLog(@"[ANTIBAN] %@ not found", bundleID);
     return nil;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Core clean logic — ported from DevicePatchService.cleanAntibanAndTelemetry
+//  Core clean — Documents telemetry files + Caches / tmp analytics dirs
 // ─────────────────────────────────────────────────────────────────────────────
 static AntibanResult performClean(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -88,40 +49,34 @@ static AntibanResult performClean(void) {
         NSString *containerPath = resolveContainerPath(bundleID);
         if (!containerPath) continue;
 
-        NSURL *containerURL = [NSURL fileURLWithPath:containerPath isDirectory:YES];
+        NSURL *base = [NSURL fileURLWithPath:containerPath isDirectory:YES];
 
-        // ── 1. Documents: удаляем все файлы, оставляем папки и antiban decoy ──────
-        NSURL *docsURL = [containerURL URLByAppendingPathComponent:@"Documents" isDirectory:YES];
-        NSArray<NSURL *> *docItems = [fm contentsOfDirectoryAtURL:docsURL
-                                     includingPropertiesForKeys:@[NSURLIsDirectoryKey]
-                                                        options:0
-                                                          error:nil];
-        for (NSURL *item in docItems) {
-            NSString *name = item.lastPathComponent;
-            NSString *lower = name.lowercaseString;
-
-            // Оставляем patch bytes и antiban decoy файлы (как в proxyapp)
+        // ── Documents ────────────────────────────────────────────────────────
+        NSURL *docsURL = [base URLByAppendingPathComponent:@"Documents" isDirectory:YES];
+        NSArray<NSURL *> *docs = [fm contentsOfDirectoryAtURL:docsURL
+                                   includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                                      options:0
+                                                        error:nil];
+        for (NSURL *item in docs) {
+            NSString *lower = item.lastPathComponent.lowercaseString;
+            // keep patch bytes and antiban decoys
             if ([lower isEqualToString:@"assembly-csharp-patch.bytes"]) continue;
-            if ([lower hasPrefix:@"antiban_"])    continue;
+            if ([lower hasPrefix:@"antiban_"])     continue;
             if ([lower hasPrefix:@"innova_cheat_"]) continue;
             if ([lower hasSuffix:@".bytes"] && [lower containsString:@"antiban"]) continue;
-
-            // Оставляем папки
+            // keep directories
             NSNumber *isDir = nil;
             [item getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
             if (isDir.boolValue) continue;
 
-            NSError *err = nil;
-            if ([fm removeItemAtURL:item error:&err]) {
+            if ([fm removeItemAtURL:item error:nil]) {
                 result.deletedDocs++;
-                NSLog(@"[ANTIBAN] Deleted doc: %@", name);
-            } else {
-                NSLog(@"[ANTIBAN] Cannot delete %@: %@", name, err.localizedDescription);
+                NSLog(@"[ANTIBAN] doc removed: %@", item.lastPathComponent);
             }
         }
 
-        // ── 2. Telemetry paths (Library/Caches + tmp) — точный список из proxyapp ──
-        NSArray<NSString *> *telemetryRelPaths = @[
+        // ── Static telemetry paths ────────────────────────────────────────────
+        NSArray<NSString *> *staticPaths = @[
             @"Library/Caches/Analytics",
             @"Library/Caches/CrashReporter",
             @"Library/Caches/crashes",
@@ -148,21 +103,15 @@ static AntibanResult performClean(void) {
             @"tmp/bugly",
             @"tmp/appsflyer-v1",
         ];
-
-        for (NSString *rel in telemetryRelPaths) {
-            NSURL *target = [containerURL URLByAppendingPathComponent:rel];
+        for (NSString *rel in staticPaths) {
+            NSURL *target = [base URLByAppendingPathComponent:rel];
             if ([fm fileExistsAtPath:target.path]) {
-                NSError *err = nil;
-                if ([fm removeItemAtURL:target error:&err]) {
-                    result.deletedCaches++;
-                } else {
-                    NSLog(@"[ANTIBAN] Cannot delete cache %@: %@", rel, err.localizedDescription);
-                }
+                if ([fm removeItemAtURL:target error:nil]) result.deletedCaches++;
             }
         }
 
-        // ── 2b. Динамическое сканирование Library/Caches по ключевым словам ─────
-        NSURL *cachesURL = [containerURL URLByAppendingPathComponent:@"Library/Caches" isDirectory:YES];
+        // ── Dynamic scan Library/Caches by keyword ───────────────────────────
+        NSURL *cachesURL = [base URLByAppendingPathComponent:@"Library/Caches" isDirectory:YES];
         NSArray<NSString *> *keywords = @[
             @"analytics", @"crash", @"bugly",
             @"firebase", @"appsflyer", @"adjust",
@@ -174,54 +123,49 @@ static AntibanResult performClean(void) {
                                                              error:nil];
         for (NSURL *item in cacheItems) {
             NSString *lname = item.lastPathComponent.lowercaseString;
-            BOOL match = NO;
             for (NSString *kw in keywords) {
-                if ([lname containsString:kw]) { match = YES; break; }
-            }
-            if (match) {
-                if ([fm removeItemAtURL:item error:nil]) result.deletedCaches++;
+                if ([lname containsString:kw]) {
+                    if ([fm removeItemAtURL:item error:nil]) result.deletedCaches++;
+                    break;
+                }
             }
         }
 
-        // ── 2c. Чистим Caches/tmp от явных config файлов ──────────────────────
-        NSURL *tmpURL = [containerURL URLByAppendingPathComponent:@"tmp" isDirectory:YES];
-        NSArray<NSString *> *specificFiles = @[
+        // ── Specific config files in Caches + tmp ────────────────────────────
+        NSURL *tmpURL = [base URLByAppendingPathComponent:@"tmp" isDirectory:YES];
+        NSArray<NSString *> *specific = @[
             @"Assembly-CSharp-patch.bytes",
             @"menu_config.json",
             @"localConfig.json",
             @"token.json",
             @".innova_token.dat"
         ];
-        for (NSURL *cleanDir in @[ cachesURL, tmpURL ]) {
-            for (NSString *fn in specificFiles) {
-                NSURL *fURL = [cleanDir URLByAppendingPathComponent:fn];
-                if ([fm fileExistsAtPath:fURL.path]) {
-                    if ([fm removeItemAtURL:fURL error:nil]) result.deletedCaches++;
-                }
+        for (NSURL *dir in @[ cachesURL, tmpURL ]) {
+            for (NSString *fn in specific) {
+                NSURL *f = [dir URLByAppendingPathComponent:fn];
+                if ([fm fileExistsAtPath:f.path])
+                    if ([fm removeItemAtURL:f error:nil]) result.deletedCaches++;
             }
         }
 
-        NSLog(@"[ANTIBAN] %@ — cleaned %ld docs, %ld caches",
+        NSLog(@"[ANTIBAN] %@ done — docs:%ld caches:%ld",
               bundleID, (long)result.deletedDocs, (long)result.deletedCaches);
     }
-
     return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AntibanCleaner singleton
+//  Singleton
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Private class extension — make readonly props writable internally
 @interface AntibanCleaner ()
-@property (nonatomic, assign, readwrite) BOOL        isLoopRunning;
+@property (nonatomic, assign, readwrite) BOOL         isLoopRunning;
 @property (nonatomic, assign, readwrite) AntibanResult lastResult;
 @end
 
 @implementation AntibanCleaner {
-    dispatch_queue_t     _queue;
-    dispatch_source_t    _timer;
-    NSRecursiveLock     *_lock;
+    dispatch_queue_t  _queue;
+    dispatch_source_t _timer;
+    NSLock           *_lock;
 }
 
 + (instancetype)shared {
@@ -234,7 +178,7 @@ static AntibanResult performClean(void) {
 - (instancetype)init {
     if (!(self = [super init])) return nil;
     _queue = dispatch_queue_create("ext.ff.antiban", DISPATCH_QUEUE_SERIAL);
-    _lock  = [NSRecursiveLock new];
+    _lock  = [NSLock new];
     _lastResult = (AntibanResult){0, 0};
     return self;
 }
@@ -242,56 +186,43 @@ static AntibanResult performClean(void) {
 - (AntibanResult)cleanOnce {
     __block AntibanResult r;
     dispatch_sync(_queue, ^{ r = performClean(); });
-    _lastResult = r;
+    self.lastResult = r;
     return r;
 }
 
 - (void)startLoop {
     [_lock lock];
-    if (_timer) {
-        [_lock unlock];
-        return; // уже запущен
-    }
+    if (_timer) { [_lock unlock]; return; }
 
-    NSLog(@"[ANTIBAN] Starting continuous loop (10s interval)");
+    NSLog(@"[ANTIBAN] loop start");
 
-    // Разовый немедленный прогон
     dispatch_async(_queue, ^{
         AntibanResult r = performClean();
-        self->_lastResult = r;
-        NSLog(@"[ANTIBAN] Initial pass: %ld docs, %ld caches",
-              (long)r.deletedDocs, (long)r.deletedCaches);
+        self.lastResult = r;
     });
 
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
     dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
-                              (uint64_t)(10.0 * NSEC_PER_SEC),
-                              (uint64_t)(1.0  * NSEC_PER_SEC));
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+        (uint64_t)(10.0 * NSEC_PER_SEC),
+        (uint64_t)(NSEC_PER_SEC));
     dispatch_source_set_event_handler(timer, ^{
         AntibanResult r = performClean();
-        self->_lastResult = r;
-        if (r.deletedDocs > 0 || r.deletedCaches > 0) {
-            NSLog(@"[ANTIBAN LOOP] Pass: %ld docs, %ld caches",
-                  (long)r.deletedDocs, (long)r.deletedCaches);
-        }
+        self.lastResult = r;
     });
     _timer = timer;
     dispatch_resume(timer);
-    _isLoopRunning = YES;
+    self.isLoopRunning = YES;
     [_lock unlock];
 }
 
 - (void)stopLoop {
     [_lock lock];
-    if (!_timer) {
-        [_lock unlock];
-        return;
-    }
-    NSLog(@"[ANTIBAN] Stopping loop");
+    if (!_timer) { [_lock unlock]; return; }
     dispatch_source_cancel(_timer);
     _timer = nil;
-    _isLoopRunning = NO;
+    self.isLoopRunning = NO;
+    NSLog(@"[ANTIBAN] loop stop");
     [_lock unlock];
 }
 
