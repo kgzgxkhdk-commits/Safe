@@ -1,6 +1,7 @@
 #import "AntibanCleaner.h"
 #import "../esp/Core/pid.h"
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Offsets from OB55 dump — ffantihack namespace
