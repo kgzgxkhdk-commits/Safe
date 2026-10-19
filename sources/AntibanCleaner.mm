@@ -1,41 +1,50 @@
 #import "AntibanCleaner.h"
 #import "../esp/Core/pid.h"
 #include <mach/mach.h>
-#include <mach/vm_map.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Offsets from OB55 dump — ffantihack namespace
 //  DKPDEMLPNOE TypeDefIndex: 1546, MHJKABKLFEB TypeDefIndex: 1548
 // ─────────────────────────────────────────────────────────────────────────────
 
-#define kGameFacadeTypeInfo      0xBB46A50ULL
+// GameFacade TypeInfo base — used to reach static fields
+#define kGameFacadeTypeInfo      0xBB46A50
 
-#define kDKP_HLCEOPAMDNH         0x0ULL
-#define kDKP_AMFEHGKDLOH         0x10ULL
-#define kDKP_MNNGFLIFFHL         0x48ULL
-#define kDKP_KLLMGALOPFG         0x44ULL
+// DKPDEMLPNOE static fields (class statics, accessed via TypeInfo → statics ptr)
+// Field offsets relative to static data block
+#define kDKP_HLCEOPAMDNH         0x0     // bool — main anticheat enabled
+#define kDKP_AMFEHGKDLOH         0x10    // uint — anticheat mode mask
+#define kDKP_MNNGFLIFFHL         0x48    // bool — report enabled flag
+#define kDKP_KLLMGALOPFG         0x44    // float — scan interval
 
-#define kMHJ_MFDMLAKBGLE         0x58ULL
-#define kMHJ_LCMPBHLJPHP         0x59ULL
-#define kMHJ_CJDEMMJEKGD         0x5AULL
-#define kMHJ_BJDPHDOPHLI         0x5BULL
-#define kMHJ_GFMCEHCMABG         0x5CULL
-#define kMHJ_KDAEOKLFPCM         0x70ULL
+// MHJKABKLFEB static fields
+#define kMHJ_MFDMLAKBGLE         0x58    // bool — scan active
+#define kMHJ_LCMPBHLJPHP         0x59    // bool — file check active
+#define kMHJ_CJDEMMJEKGD         0x5A    // bool — mem check active
+#define kMHJ_BJDPHDOPHLI         0x5B    // bool — process check active
+#define kMHJ_GFMCEHCMABG         0x5C    // bool — behaviour check active
+#define kMHJ_KDAEOKLFPCM         0x70    // int — detection result code
 
-#define kRVA_LOOPCABFPMJ         0x20F19D0ULL
-#define kRVA_IMOMCMOPODE         0x20F2890ULL
-#define kRVA_BKIHNKHJHAM         0x20F172CULL
+// DKPDEMLPNOE method RVAs (from dump, VA = offset from module base)
+#define kRVA_LOOPCABFPMJ         0x20F19D0   // void LOOPCABFPMJ(bool) — anticheat loop toggle
+#define kRVA_IMOMCMOPODE         0x20F2890   // void IMOMCMOPODE(bool) — report loop toggle
+#define kRVA_BKIHNKHJHAM         0x20F172C   // void BKIHNKHJHAM(string, bool)
 
-#define kRVA_HIAKKLNIKFM         0x21E8E48ULL
-#define kRVA_NLJNAOBBPEA         0x21E98BCULL
-#define kRVA_INICGCCOGEC         0x21EC4DCULL
-#define kRVA_JHACIFHANIL         0x21EC934ULL
+// MHJKABKLFEB method RVAs
+#define kRVA_HIAKKLNIKFM         0x21E8E48   // int HIAKKLNIKFM(bool, int, long) — main scan
+#define kRVA_NLJNAOBBPEA         0x21E98BC   // int NLJNAOBBPEA(string, long, long, bool, long) — file hash
+#define kRVA_INICGCCOGEC         0x21EC4DC   // void INICGCCOGEC(bool) — init toggle
+#define kRVA_JHACIFHANIL         0x21EC934   // void JHACIFHANIL() — reset
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bundle IDs
 // ─────────────────────────────────────────────────────────────────────────────
 static NSArray<NSString *> *supportedBundleIDs(void) {
     return @[ @"com.dts.freefireth", @"com.dts.freefiremax" ];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Container resolution — direct metadata scan
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString * _Nullable resolveContainerPath(NSString *bundleID) {
     NSString *root = @"/var/mobile/Containers/Data/Application";
@@ -55,58 +64,49 @@ static NSArray<NSString *> *watchedRelDirs(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Patch one byte at an RVA within the game's dyld-loaded image.
+//  Writes NOP (0x1F 0x20 0x03 0xD5 on arm64) over the function prologue
+//  so the anticheat method returns immediately.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// arm64 NOP and RET instruction bytes
 static const uint8_t kNOP4[4] = { 0x1F, 0x20, 0x03, 0xD5 };
 static const uint8_t kRET[4]  = { 0xC0, 0x03, 0x5F, 0xD6 };
 
+// Get game module base — uses get_image_base_address from pid.h
+// get_task is populated by the esp layer when it first reads game memory
 static uint64_t getGameBase(void) {
+    // get_task is already set by pid.mm when esp first accesses the game.
+    // get_image_base_address finds UnityFramework (the main il2cpp binary).
     if (get_task == MACH_PORT_NULL) return 0;
     mach_vm_address_t base = get_image_base_address(get_task, "UnityFramework");
     if (!base) base = get_image_base_address(get_task, "FreeFire");
     return (uint64_t)base;
 }
 
+// Write raw bytes into the game process at base + rva using the existing task port
+// _write is declared in pid.mm — uses mach_vm_write via kernel task port,
+// which bypasses page protection entirely (no vm_protect needed).
+extern bool _write(long addr, const void *buffer, int len);
+
 static BOOL patchGameBytes(uint64_t base, uint64_t rva,
                             const uint8_t *bytes, size_t len) {
-    if (get_task == MACH_PORT_NULL || base == 0) return NO;
-
-    uint64_t va = base + rva;
-
-    vm_address_t pageStart = (vm_address_t)(va & ~0xFFFULL);
-    vm_size_t    pageSize  = (vm_size_t)0x1000;
-    if ((va + len) > (uint64_t)(pageStart + pageSize))
-        pageSize = (vm_size_t)0x2000;
-
-    kern_return_t kr = vm_protect(get_task,
-                                  pageStart,
-                                  pageSize,
-                                  FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[ANTIBAN] vm_protect failed @ 0x%llx: %d", va, kr);
-    }
-
-    kr = vm_write(get_task,
-                  (vm_address_t)va,
-                  (vm_offset_t)bytes,
-                  (mach_msg_type_number_t)len);
-
-    vm_protect(get_task,
-               pageStart,
-               pageSize,
-               FALSE,
-               VM_PROT_READ | VM_PROT_EXECUTE);
-
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[ANTIBAN] vm_write failed @ 0x%llx: %d", va, kr);
-        return NO;
-    }
-    return YES;
+    if (base == 0) return NO;
+    long va = (long)(base + rva);
+    bool ok = _write(va, bytes, (int)len);
+    if (!ok) NSLog(@"[ANTIBAN] _write failed @ 0x%lx", va);
+    return ok ? YES : NO;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bypass — patch anticheat functions to return immediately (NOP+RET)
+//  and zero out the static enable flags via kernel W
 // ─────────────────────────────────────────────────────────────────────────────
 static void applyAnticheatBypass(uint64_t base) {
     if (base == 0) { NSLog(@"[ANTIBAN] base=0, bypass skipped"); return; }
 
+    // Patch → NOP NOP NOP RET (4 arm64 instructions = 16 bytes)
+    // Makes each anticheat function return immediately
     struct { uint64_t rva; const char *name; } targets[] = {
         { kRVA_LOOPCABFPMJ, "LOOPCABFPMJ" },
         { kRVA_IMOMCMOPODE, "IMOMCMOPODE" },
@@ -123,19 +123,21 @@ static void applyAnticheatBypass(uint64_t base) {
 
     for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
         if (patchGameBytes(base, targets[i].rva, patch, sizeof(patch)))
-            NSLog(@"[ANTIBAN] ok %s @ 0x%llx",
-                  targets[i].name, base + targets[i].rva);
+            NSLog(@"[ANTIBAN] ✓ %s @ 0x%llx", targets[i].name, base + targets[i].rva);
     }
     NSLog(@"[ANTIBAN] bypass done — %zu functions patched",
           sizeof(targets)/sizeof(targets[0]));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  File-level clean — removes telemetry files the anticheat reads/writes
+// ─────────────────────────────────────────────────────────────────────────────
 static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID) {
     NSFileManager *fm = [NSFileManager defaultManager];
     AntibanResult r   = {0, 0};
     NSURL *base = [NSURL fileURLWithPath:containerPath isDirectory:YES];
 
+    // Documents — remove all files except patch bytes and antiban decoys
     NSURL *docsURL = [base URLByAppendingPathComponent:@"Documents" isDirectory:YES];
     for (NSURL *item in [fm contentsOfDirectoryAtURL:docsURL
                            includingPropertiesForKeys:@[NSURLIsDirectoryKey]
@@ -151,6 +153,7 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
         if ([fm removeItemAtURL:item error:nil]) r.deletedDocs++;
     }
 
+    // Static telemetry dirs + files
     NSArray<NSString *> *staticRel = @[
         @"Library/Caches/Analytics",       @"Library/Caches/CrashReporter",
         @"Library/Caches/crashes",         @"Library/Caches/bugly",
@@ -165,6 +168,7 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
         [NSString stringWithFormat:@"Library/Caches/%@/Cache.db-shm", bundleID],
         [NSString stringWithFormat:@"Library/Caches/%@/Cache.db-wal", bundleID],
         [NSString stringWithFormat:@"Library/Caches/%@/fsCachedData", bundleID],
+        // ffrtc_log.txt — from DebuggerFileOutput.RTC_LOG_NAME
         @"Documents/ffrtc_log.txt",
         @"Documents/ff_magicvoice_log.txt",
         @"Documents/ff_magicvoice_engine_log.txt",
@@ -178,6 +182,7 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
             if ([fm removeItemAtURL:t error:nil]) r.deletedCaches++;
     }
 
+    // Dynamic keyword scan in Library/Caches
     NSURL *cachesURL = [base URLByAppendingPathComponent:@"Library/Caches" isDirectory:YES];
     for (NSURL *item in [fm contentsOfDirectoryAtURL:cachesURL
                             includingPropertiesForKeys:nil options:0 error:nil]) {
@@ -191,9 +196,9 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
             }
     }
 
+    // Specific files
     NSURL *tmpURL = [base URLByAppendingPathComponent:@"tmp" isDirectory:YES];
-    NSArray<NSURL *> *scanDirs = @[ cachesURL, tmpURL ];
-    for (NSURL *dir in scanDirs)
+    for (NSURL *dir in @[ cachesURL, tmpURL ])
         for (NSString *fn in @[ @"Assembly-CSharp-patch.bytes", @"menu_config.json",
                                  @"localConfig.json", @"token.json", @".innova_token.dat" ]) {
             NSURL *f = [dir URLByAppendingPathComponent:fn];
@@ -220,18 +225,22 @@ static AntibanResult performClean(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Private extension
+// ─────────────────────────────────────────────────────────────────────────────
 @interface AntibanCleaner ()
 @property (nonatomic, assign, readwrite) BOOL          isWatching;
 @property (nonatomic, assign, readwrite) AntibanResult lastResult;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  AntibanCleaner
+// ─────────────────────────────────────────────────────────────────────────────
 @implementation AntibanCleaner {
-    dispatch_queue_t            _queue;
-    NSLock                     *_lock;
-    NSMutableArray<NSValue *>  *_sourceRefs;
+    dispatch_queue_t           _queue;
+    NSLock                    *_lock;
+    NSMutableArray<NSValue *> *_sourceRefs;
     NSMutableArray<NSNumber *> *_fds;
-    BOOL                        _bypassApplied;
+    BOOL                       _bypassApplied;
 }
 
 + (instancetype)shared {
@@ -243,11 +252,11 @@ static AntibanResult performClean(void) {
 
 - (instancetype)init {
     if (!(self = [super init])) return nil;
-    _queue         = dispatch_queue_create("ext.ff.antiban", DISPATCH_QUEUE_SERIAL);
-    _lock          = [NSLock new];
-    _sourceRefs    = [NSMutableArray new];
-    _fds           = [NSMutableArray new];
-    _lastResult    = (AntibanResult){0, 0};
+    _queue      = dispatch_queue_create("ext.ff.antiban", DISPATCH_QUEUE_SERIAL);
+    _lock       = [NSLock new];
+    _sourceRefs = [NSMutableArray new];
+    _fds        = [NSMutableArray new];
+    _lastResult = (AntibanResult){0, 0};
     _bypassApplied = NO;
     return self;
 }
@@ -259,11 +268,15 @@ static AntibanResult performClean(void) {
     return r;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  startWatching — called when game process is detected
+// ─────────────────────────────────────────────────────────────────────────────
 - (void)startWatching {
     [_lock lock];
     if (_isWatching) { [_lock unlock]; return; }
     NSLog(@"[ANTIBAN] startWatching");
 
+    // 1. Apply anticheat bypass (once per process lifetime)
     if (!_bypassApplied) {
         uint64_t base = getGameBase();
         if (base > 0) {
@@ -274,10 +287,12 @@ static AntibanResult performClean(void) {
         }
     }
 
+    // 2. Immediate file clean pass
     dispatch_async(_queue, ^{
         self.lastResult = performClean();
     });
 
+    // 3. Set up vnode watchers on container dirs
     NSMutableArray<NSString *> *dirs = [NSMutableArray new];
     for (NSString *bid in supportedBundleIDs()) {
         NSString *container = resolveContainerPath(bid);
@@ -297,8 +312,7 @@ static AntibanResult performClean(void) {
         [_fds addObject:@(fd)];
 
         dispatch_source_t src = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_VNODE,
-            (uintptr_t)fd,
+            DISPATCH_SOURCE_TYPE_VNODE, (uintptr_t)fd,
             DISPATCH_VNODE_WRITE | DISPATCH_VNODE_ATTRIB,
             _queue);
 
@@ -317,6 +331,9 @@ static AntibanResult performClean(void) {
     [_lock unlock];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  stopWatching — called when game process disappears
+// ─────────────────────────────────────────────────────────────────────────────
 - (void)stopWatching {
     [_lock lock];
     if (!_isWatching) { [_lock unlock]; return; }
@@ -329,7 +346,7 @@ static AntibanResult performClean(void) {
     }
     [_sourceRefs removeAllObjects];
     [_fds removeAllObjects];
-    _bypassApplied = NO;
+    _bypassApplied = NO;   // reset so next launch re-applies
 
     dispatch_async(_queue, ^{ self.lastResult = performClean(); });
 
