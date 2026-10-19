@@ -7,6 +7,7 @@
 #include "oxorany/oxorany.h"
 
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 
 // ========== THÊM MỚI: Thời gian tự động thoát ==========
 static const CFTimeInterval kAutoExitTimeout = 30.0; // 30 giây
@@ -697,7 +698,8 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     UIDocumentInteractionController *dic =
         [UIDocumentInteractionController interactionControllerWithURL:tmp];
     dic.UTI = @"com.apple.mobileconfig";
-    BOOL shown = [dic presentOpenInMenuFromRect:_dnsButton.frame
+    CGRect dnsRectInView = [_dnsButton convertRect:_dnsButton.bounds toView:self.view];
+    BOOL shown = [dic presentOpenInMenuFromRect:dnsRectInView
                                         inView:self.view
                                       animated:YES];
     if (!shown) {
