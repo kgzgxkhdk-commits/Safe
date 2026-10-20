@@ -870,12 +870,13 @@ static void AppendUMASkeleton(ESPGeometryBuffers *buffers, uint64_t pawn, float 
     g_SilentBestTarget = bestTarget;
 
     // ── Silent Aim ──────────────────────────────────────────
-    if (aimsilent1)
-        // [FIX-2] OB55 PGAIFNOGDAN dot-check — передаём forward камеры
-        SilentUpdateCamFwd(camFwd);
+    // [FIX-2] передаём forward камеры для PGAIFNOGDAN dot-check
+    SilentUpdateCamFwd(camFwd);
+    if (aimsilent1) {
         RunSilentAim(bestTarget, myPawn, aimPosition, get_IsFiring(myPawn));
-    else
+    } else {
         ResetSilentAim();
+    }
 
     // ── Aim Magnet ──────────────────────────────────────────
     if (aimMagnet) {
