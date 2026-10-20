@@ -30,58 +30,6 @@ static const uint8_t kRET_ZERO[8] = { 0x00, 0x00, 0x80, 0xD2,   // MOV X0, #0
                                        0xC0, 0x03, 0x5F, 0xD6 }; // RET
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Neutral Seed 322B (from AntibanPatchService.swift — SHA-256 verified)
-//  Written to Documents/Assembly-CSharp-patch.bytes to prevent TSS file scan
-//  from finding the real patch bytes. The neutral seed is a valid-looking
-//  but benign IFix payload that passes the file hash check.
-// ─────────────────────────────────────────────────────────────────────────────
-static NSData *neutralSeedData(void) {
-    static NSData *seed = nil;
-    static dispatch_once_t t;
-    dispatch_once(&t, ^{
-        uint8_t raw[] = {
-            0xcb, 0xa2, 0xb4, 0x0d, 0xb2, 0x19, 0xa3, 0x66, 0x64, 0x49, 0x46, 0x69,
-            0x78, 0x2e, 0x49, 0x4c, 0x46, 0x69, 0x78, 0x49, 0x6e, 0x74, 0x65, 0x72,
-            0x66, 0x61, 0x63, 0x65, 0x42, 0x72, 0x69, 0x64, 0x67, 0x65, 0x2c, 0x20,
-            0x41, 0x73, 0x73, 0x65, 0x6d, 0x62, 0x6c, 0x79, 0x2d, 0x43, 0x53, 0x68,
-            0x61, 0x72, 0x70, 0x2c, 0x20, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
-            0x3d, 0x30, 0x2e, 0x38, 0x36, 0x2e, 0x30, 0x2e, 0x35, 0x31, 0x38, 0x2c,
-            0x20, 0x43, 0x75, 0x6c, 0x74, 0x75, 0x72, 0x65, 0x3d, 0x6e, 0x65, 0x75,
-            0x74, 0x72, 0x61, 0x6c, 0x2c, 0x20, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63,
-            0x4b, 0x65, 0x79, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x3d, 0x6e, 0x75, 0x6c,
-            0x6c,
-            // 28 zero bytes
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            // part2
-            0x63, 0x49, 0x46, 0x69, 0x78, 0x2e, 0x57, 0x72, 0x61, 0x70, 0x70, 0x65,
-            0x72, 0x73, 0x4d, 0x61, 0x6e, 0x61, 0x67, 0x65, 0x72, 0x49, 0x6d, 0x70,
-            0x6c, 0x2c, 0x20, 0x41, 0x73, 0x73, 0x65, 0x6d, 0x62, 0x6c, 0x79, 0x2d,
-            0x43, 0x53, 0x68, 0x61, 0x72, 0x70, 0x2c, 0x20, 0x56, 0x65, 0x72, 0x73,
-            0x69, 0x6f, 0x6e, 0x3d, 0x30, 0x2e, 0x38, 0x36, 0x2e, 0x30, 0x2e, 0x35,
-            0x31, 0x38, 0x2c, 0x20, 0x43, 0x75, 0x6c, 0x74, 0x75, 0x72, 0x65, 0x3d,
-            0x6e, 0x65, 0x75, 0x74, 0x72, 0x61, 0x6c, 0x2c, 0x20, 0x50, 0x75, 0x62,
-            0x6c, 0x69, 0x63, 0x4b, 0x65, 0x79, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x3d,
-            0x6e, 0x75, 0x6c, 0x6c, 0x4b, 0x2c, 0x20, 0x41, 0x73, 0x73, 0x65, 0x6d,
-            0x62, 0x6c, 0x79, 0x2d, 0x43, 0x53, 0x68, 0x61, 0x72, 0x70, 0x2c, 0x20,
-            0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x3d, 0x30, 0x2e, 0x38, 0x36,
-            0x2e, 0x30, 0x2e, 0x35, 0x31, 0x38, 0x2c, 0x20, 0x43, 0x75, 0x6c, 0x74,
-            0x75, 0x72, 0x65, 0x3d, 0x6e, 0x65, 0x75, 0x74, 0x72, 0x61, 0x6c, 0x2c,
-            0x20, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4b, 0x65, 0x79, 0x54, 0x6f,
-            0x6b, 0x65, 0x6e, 0x3d, 0x6e, 0x75, 0x6c, 0x6c,
-            // 9 zero bytes
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        };
-        seed = [NSData dataWithBytes:raw length:sizeof(raw)]; // 322 bytes
-    });
-    return seed;
-}
-
-static const char *kSafeConfig = "{\"testCodePatch\":true}\n";
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  38 telemetry paths from AntibanPatchService.swift (Delta Mach-O extract)
 //  These are relative paths inside the game container
 // ─────────────────────────────────────────────────────────────────────────────
@@ -233,9 +181,7 @@ static void reapplyIfNeeded(void) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  File-level clean — 38 telemetry paths + Documents wipe
-//  Also writes Neutral Seed to Assembly-CSharp-patch.bytes (322 bytes)
-//  and safe localConfig.json to prevent TSS file integrity check from
-//  flagging the patch bytes file.
+//  NOTE: Does NOT write Assembly-CSharp-patch.bytes / localConfig.json anymore.
 // ─────────────────────────────────────────────────────────────────────────────
 static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -261,19 +207,17 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
         }
     }
 
-    // 2. Documents — wipe all files except neutral seed and known-good files
+    // 2. Documents — wipe all files. Assembly-CSharp-patch.bytes and
+    //    localConfig.json are no longer written or preserved, so any
+    //    leftovers from previous versions get cleaned up here too.
     NSURL *docsURL = [base URLByAppendingPathComponent:@"Documents" isDirectory:YES];
     NSArray<NSURL *> *docItems = [fm contentsOfDirectoryAtURL:docsURL
                                     includingPropertiesForKeys:@[NSURLIsDirectoryKey]
                                                        options:0 error:nil];
     for (NSURL *item in docItems) {
-        NSString *name  = item.lastPathComponent;
-        NSString *lower = name.lowercaseString;
-        // Keep neutral seed, safe config, dirs, innova files
-        if ([lower isEqualToString:@"assembly-csharp-patch.bytes"]) continue;
-        if ([lower isEqualToString:@"localconfig.json"])             continue;
-        if ([lower hasPrefix:@"innova_cheat_"])                      continue;
-        if ([lower isEqualToString:@"contentcache"])                 continue; // already handled
+        NSString *lower = item.lastPathComponent.lowercaseString;
+        if ([lower hasPrefix:@"innova_cheat_"]) continue;
+        if ([lower isEqualToString:@"contentcache"]) continue; // already handled
         NSNumber *isDir = nil;
         [item getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
         if (isDir.boolValue) continue;
@@ -296,27 +240,7 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
             }
     }
 
-    // 4. Write Neutral Seed 322B → Assembly-CSharp-patch.bytes
-    NSURL *patchFile = [docsURL URLByAppendingPathComponent:@"Assembly-CSharp-patch.bytes"];
-    NSData *seed = neutralSeedData();
-    BOOL needWrite = YES;
-    if ([fm fileExistsAtPath:patchFile.path]) {
-        NSData *existing = [NSData dataWithContentsOfURL:patchFile];
-        if (existing.length == seed.length && [existing isEqualToData:seed]) needWrite = NO;
-    }
-    if (needWrite) {
-        [fm createDirectoryAtURL:docsURL withIntermediateDirectories:YES attributes:nil error:nil];
-        [seed writeToURL:patchFile atomically:YES];
-    }
-
-    // 5. Write safe localConfig.json
-    NSURL *cfgFile = [docsURL URLByAppendingPathComponent:@"localConfig.json"];
-    if (![fm fileExistsAtPath:cfgFile.path]) {
-        NSData *cfg = [NSData dataWithBytes:kSafeConfig length:strlen(kSafeConfig)];
-        [cfg writeToURL:cfgFile atomically:YES];
-    }
-
-    // 6. Bundle ID specific caches
+    // 4. Bundle ID specific caches
     for (NSString *suffix in @[ @"Cache.db", @"Cache.db-shm",
                                  @"Cache.db-wal", @"fsCachedData" ]) {
         NSURL *t = [cachesURL URLByAppendingPathComponent:
@@ -390,14 +314,11 @@ static AntibanResult performClean(void) {
     NSLog(@"[ANTIBAN] startWatching");
 
     dispatch_async(_queue, ^{
-        // Apply bypass immediately when game starts
         _cachedBase = getUnityBase();
         if (_cachedBase) applyBypass(_cachedBase);
-        // First clean pass
         self.lastResult = performClean();
     });
 
-    // Open vnode watchers on all container subdirs
     NSMutableArray<NSString *> *dirsToWatch = [NSMutableArray new];
     for (NSString *bid in supportedBundleIDs()) {
         NSString *container = resolveContainerPath(bid);
@@ -421,7 +342,6 @@ static AntibanResult performClean(void) {
             DISPATCH_VNODE_WRITE | DISPATCH_VNODE_ATTRIB, _queue);
 
         dispatch_source_set_event_handler(src, ^{
-            // Any file write in a watched dir → immediate clean + bypass check
             self.lastResult = performClean();
         });
         int fdCopy = fd;
