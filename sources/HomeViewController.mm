@@ -629,14 +629,14 @@ apiclient_set_token(oxorany("wZ3Q/xYPjTIWo5gRdA5jLXRDg7hkxxY4ZQlWdtF1uamNi0nwolE
     BOOL game = gameNow || (_gameMissingStreak < 3);
 
     // ── ANTIBAN AUTO-TRIGGER ─────────────────────────────────────────────────
-    // Game edge: NOT running → running = start vnode watchers.
-    // running → NOT running = stop watchers + final clean pass.
-    if (game && !_lastGameRunning) {
+    // Use gameNow (raw, no grace) for edge detection so we never get a false
+    // positive on first poll. UI/HUD uses the grace-buffered `game` bool.
+    if (gameNow && !_lastGameRunning) {
         [[AntibanCleaner shared] startWatching];
-    } else if (!game && _lastGameRunning) {
+    } else if (!gameNow && _lastGameRunning) {
         [[AntibanCleaner shared] stopWatching];
     }
-    _lastGameRunning = game;
+    _lastGameRunning = gameNow;
     // ─────────────────────────────────────────────────────────────────────────
 
     UIColor *accent = [UIColor colorWithRed:0.77f green:0.70f blue:0.50f alpha:1.0f];
