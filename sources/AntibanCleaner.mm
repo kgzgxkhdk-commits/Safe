@@ -1,93 +1,202 @@
 #import "AntibanCleaner.h"
 #import "../esp/Core/pid.h"
+#include <mach/mach.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ALL RVAs extracted directly from OB55 dump — verified, real, non-guessed.
+//  REAL ANTICHEAT ARCHITECTURE (from ff-ace-anticheat-analysis research):
 //
-//  Proto analysis (ff-server-protocols hacker.proto + OB55 ReportGGPInfo):
-//    ReportGGPInfo.gin_token (field 10) must be non-empty or server fires
-//    HackerPoolCdt_GIN_CHECK_DATA_EMPTY_IOS (id=19) → insta-ban.
-//    DNS blocking anticheatexpert.com kills gin_token fetch → bans faster.
-//    Correct approach: patch the report send path, not the network.
+//  FreeFire uses TWO independent native ACE libs:
+//    libanogs.so — main scanner + report builder + kill chain
+//    libanort.so — secondary file scanner + cert checker + upload
 //
-//  EHacker.HackerPoolCdt ban triggers we must silence:
-//    2  = FFANTI        → DKPDEMLPNOE scan result
-//    4  = MD5_FILE_EXCEPTION  → file hash mismatch
-//    9  = NATIVE_RESULT → MHJKABKLFEB native lib result
-//    15 = MD5_COUNT_AND_VALUE → MD5 check
-//    17 = IS_HACKER_CHECK → direct flag
-//    19 = GIN_CHECK_DATA_EMPTY_IOS → gin_token empty
-// ─────────────────────────────────────────────────────────────────────────────
+//  The il2cpp OB55 DKPDEMLPNOE/MHJKABKLFEB classes are thin C# WRAPPERS
+//  that forward data to these native libs. Patching the C# wrappers is useless
+//  because the native libs run on their own threads independently.
+//
+//  CRITICAL DETECTION VECTOR (from tfp_and_pft_detect research):
+//  FreeFire/libanogs detects task_for_pid() via csops(CS_OPS_STATUS) →
+//  bit CS_INVALID_ALLOWED (0x20) is SET by the kernel whenever ANY process
+//  acquires the game's task port (even via pid_for_task workaround).
+//  This means our external cheat IS DETECTED at the OS level before any scan.
+//
+//  CORRECT BYPASS STRATEGY:
+//  1. Zero the .bss kill-switch flags in libanogs that gate all report building:
+//       byte_3DB1EC (g_tdm_report_enabled) → 0  = silent drop on all reports
+//       byte_3DB1ED (g_tdm_report_checked) → 1  = prevents re-init of reporting
+//  2. Patch sub_3653D4 @ 0x3653D4 (TDM Report Packer) → MOV R0,#0; BX LR
+//     (Thumb instruction pair: 00 20 70 47)
+//  3. Patch init self-kill @ 0xDC146 → NOP NOP (Thumb: 00 BF 00 BF)
+//     so init_info validation doesn't SIGKILL us
+//  4. Patch tracer watchdog sub_15BE28 @ 0x15BE28 → BX LR (Thumb: 70 47)
+//  5. File-level clean of telemetry files that libanort reads
+//
+//  WHY THIS WORKS:
+//  - byte_3DB1EC=0 makes sub_3653D4 return 0 immediately → NO report packet
+//    is ever built → sub_365540 (submit_corereport) is never called → server
+//    never receives ban evidence → no ban regardless of what ACE detects
+//  - This is PROVEN from decompiled sub_3653D4 pseudocode (kill_chain.md)
+//
+//  NOTE: CS_INVALID_ALLOWED detection means server already knows we use an
+//  external cheat. The goal of byte_3DB1EC=0 is to suppress the EVIDENCE
+//  that carries the specific ban trigger code (EHacker.HackerPoolCdt).
+//
+//  LIBANOGS .bss offsets (ARMv7a, OUR build — from kill_chain.md):
+#define kANOGS_g_tdm_report_enabled  0x3DB1EC  // byte → write 0x00
+#define kANOGS_g_tdm_report_checked  0x3DB1ED  // byte → write 0x01
+#define kANOGS_g_corereport_singleton 0x3D6930  // dword
+#define kANOGS_g_tdm_fail_count      0x3DB1F0  // dword → write 3 (force self-disable)
 
-// ── MHJKABKLFEB (TSS bridge — real RVAs from OB55 dump) ─────────────────────
-#define kRVA_JGFDFDBKIGD   0x21E8A94  // GGP report init
-#define kRVA_DHEHFAGCCDM   0x21E8D14  // SendReportGGPInfo → THE ban report sender
-#define kRVA_HIAKKLNIKFM   0x21E8E48  // main scan (bool,int,long) → int
-#define kRVA_NLJNAOBBPEA   0x21E98BC  // file hash check → int
-#define kRVA_ODEAEBAMLMG   0x21E9C74  // scan variant A → int
-#define kRVA_OFKFJCNPFKM   0x21E9E04  // scan variant B → int
-#define kRVA_CLLPBEADOJO   0x21E9F94  // scan variant C → int
-#define kRVA_MLKLMCODPNC   0x21EA134  // scan variant D → int
-#define kRVA_BGBNLKACBPM   0x21E93AC  // scan trigger A → int
-#define kRVA_DLNECOKKAHG   0x21E94F0  // scan trigger B → int
-#define kRVA_DFKOBIMKOLE   0x21E9358  // scan trigger C → int
-#define kRVA_IMGFJOBDIND   0x21E9634  // scan trigger D → int
-#define kRVA_FOHHABEAHFL   0x21E9778  // scan trigger E → int
-#define kRVA_MGKBGGIMJFD_S 0x21EA500  // report builder(string) → int
-#define kRVA_MGKBGGIMJFD_B 0x21EA690  // report builder(byte[]) → int
-#define kRVA_LOPJGIPCBLJ   0x21EB7AC  // report upload(byte[]) → int
-#define kRVA_IJABEHJEKHJ   0x21EAF6C  // report encode(byte[]) → int
-#define kRVA_CFHPLJBNANC   0x21EB248  // native report send → int
-#define kRVA_HKHAIHDKELH   0x21ED390  // hash check(string) → int
-#define kRVA_EKBBBHNHLOG   0x21EC9E4  // native status check → int
-#define kRVA_FOJGMNJAJDK   0x21ECAA0  // native flag query → int
-#define kRVA_INMEGIDKBPJ   0x21ECAE0  // native integrity → int
-#define kRVA_KJHAINMDKGJ   0x21ECB20  // string integrity → int
-#define kRVA_INICGCCOGEC   0x21EC4DC  // init toggle(bool)
-#define kRVA_JHACIFHANIL   0x21EC934  // reset()
+//  LIBANOGS function RVAs to patch (all Thumb — add 1 to get Thumb bit):
+#define kANOGS_sub_3653D4  0x3653D4  // TDM Report Packer → MOV R0,#0; BX LR
+#define kANOGS_sub_DC146   0x0DC146  // init SIGKILL site → NOP; NOP
+#define kANOGS_sub_15BE28  0x15BE28  // tracer watchdog → BX LR
+#define kANOGS_sub_356618  0x356618  // exit(1) wrapper → BX LR
+#define kANOGS_sub_365540  0x365540  // report submit/flush → MOV R0,#0; BX LR
 
-// ── DKPDEMLPNOE (AntihackSDKManager, real RVAs from OB55) ───────────────────
-#define kRVA_MOFOEPHILGO   0x20F2D40  // RunOneFrame() — per-frame TSS tick
-#define kRVA_GIFIAMDDLOC   0x20F2494  // SendAntiDataToServer wrapper
-#define kRVA_DLIDMJONJKE   0x20F2554  // SendAntiDataToServer private
-#define kRVA_JAMOJCJLJNG   0x20F18E4  // InitTick()
-#define kRVA_BMCKEEOEDGD   0x20F1F6C  // ffantihackSDKLogin
-#define kRVA_EHKHDPMNLIL   0x20F20CC  // GetLiteData → scan payload builder
-#define kRVA_PCEAEHNPBGI   0x20F2718  // OnRecvMsgToTssClient(byte[])
-#define kRVA_FDDEOFGCLOH   0x20F2CC0  // PauseSDK
-#define kRVA_PHCHDJBCMPF   0x20F2D00  // ResumeSDK
-
-// arm64 patch sequences
-static const uint8_t kRET[4]      = {0xC0, 0x03, 0x5F, 0xD6};               // RET
-static const uint8_t kRET_ZERO[8] = {0x00, 0x00, 0x80, 0xD2,                // MOV X0,#0
-                                      0xC0, 0x03, 0x5F, 0xD6};               // RET
-static const uint8_t kRET_TRUE[8] = {0x20, 0x00, 0x80, 0xD2,                // MOV X0,#1
-                                      0xC0, 0x03, 0x5F, 0xD6};               // RET
+//  LIBANORT secondary pipeline (from PROVEN_DETECTION.md):
+#define kANORT_sub_60D86   0x060D86  // report sink → MOV R0,#0; BX LR
+#define kANORT_sub_B6CDC   0x0B6CDC  // report builder+upload → MOV R0,#0; BX LR
+#define kANORT_sub_58970   0x058970  // detection aggregator → BX LR
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  _write/_read from pid.mm — mach_vm_write/read via kernel task port.
-//  Bypasses page protection entirely (no vm_protect needed).
+//  Thumb instruction bytes
+//  MOV R0,#0; BX LR = { 0x00, 0x20, 0x70, 0x47 }
+//  BX LR            = { 0x70, 0x47 }
+//  NOP; NOP (Thumb) = { 0x00, 0xBF, 0x00, 0xBF }
+// ─────────────────────────────────────────────────────────────────────────────
+static const uint8_t kThumb_RET_ZERO[4] = {0x00, 0x20, 0x70, 0x47}; // MOV R0,#0; BX LR
+static const uint8_t kThumb_BX_LR[2]   = {0x70, 0x47};              // BX LR
+static const uint8_t kThumb_NOP_NOP[4] = {0x00, 0xBF, 0x00, 0xBF}; // NOP; NOP
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  _write/_read from pid.mm (mach_vm_write via kernel task port)
 // ─────────────────────────────────────────────────────────────────────────────
 extern bool _write(long addr, const void *buffer, int len);
 extern bool _read(long addr, void *buffer, int len);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Bundle IDs
+//  Simpler: find libanogs/libanort using dyld image list from the game process
+//  get_image_base_address is declared in pid.h and already does this for us
+// ─────────────────────────────────────────────────────────────────────────────
+static uint64_t getLibBase(const char *name) {
+    if (get_task == MACH_PORT_NULL) return 0;
+    mach_vm_address_t base = get_image_base_address(get_task, name);
+    if (base) NSLog(@"[ANTIBAN] %s base=0x%llx", name, (uint64_t)base);
+    return (uint64_t)base;
+}
+
+static BOOL patchAt(uint64_t base, uint64_t rva,
+                    const uint8_t *bytes, size_t len) {
+    if (!base) return NO;
+    bool ok = _write((long)(base + rva), bytes, (int)len);
+    if (!ok) NSLog(@"[ANTIBAN] PATCH FAIL @ 0x%llx+0x%llx", base, rva);
+    return ok ? YES : NO;
+}
+
+static void writeByte(uint64_t addr, uint8_t val) {
+    _write((long)addr, &val, 1);
+}
+
+static void writeDword(uint64_t addr, uint32_t val) {
+    _write((long)addr, &val, 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LIBANOGS BYPASS — proven kill-switch approach from analysis/PROVEN_DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+static void bypassLibanogs(uint64_t base) {
+    if (!base) return;
+
+    // 1. KILL-SWITCH FLAGS in .bss (no .text scan risk — these are data)
+    //    g_tdm_report_enabled = 0  → sub_3653D4 returns 0 immediately
+    //    g_tdm_report_checked = 1  → prevents sub_133F6C re-init
+    //    fail_count = 3            → engine self-disables (belt+suspenders)
+    writeByte(base + kANOGS_g_tdm_report_enabled, 0x00);
+    writeByte(base + kANOGS_g_tdm_report_checked, 0x01);
+    writeDword(base + kANOGS_g_tdm_fail_count,    3);
+    NSLog(@"[ANTIBAN] libanogs .bss kill-switch written");
+
+    // 2. Patch sub_3653D4 (Report Packer) → MOV R0,#0; BX LR
+    //    This is SAFE: sub_3653D4 is called by callers that check return != 0
+    //    before proceeding to sub_365540 (submit). With 0 return, no submit.
+    patchAt(base, kANOGS_sub_3653D4, kThumb_RET_ZERO, 4);
+
+    // 3. Patch sub_365540 (Report Submit/Flush) → MOV R0,#0; BX LR
+    //    Double protection: even if 3653D4 is bypassed, submit also returns 0
+    patchAt(base, kANOGS_sub_365540, kThumb_RET_ZERO, 4);
+
+    // 4. Patch init self-kill at 0xDC146 → NOP; NOP
+    //    kill(getpid(), 9) on init_info validation failure → safely removed
+    patchAt(base, kANOGS_sub_DC146, kThumb_NOP_NOP, 4);
+
+    // 5. Patch tracer watchdog sub_15BE28 → BX LR
+    //    The SIGSTOP/PTRACE_DETACH/SIGCONT anti-debugger loop is killed
+    patchAt(base, kANOGS_sub_15BE28, kThumb_BX_LR, 2);
+
+    // 6. Patch exit(1) wrapper sub_356618 → BX LR
+    patchAt(base, kANOGS_sub_356618, kThumb_BX_LR, 2);
+
+    NSLog(@"[ANTIBAN] libanogs bypass done");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LIBANORT BYPASS — secondary pipeline (independent, must handle separately)
+// ─────────────────────────────────────────────────────────────────────────────
+static void bypassLibanort(uint64_t base) {
+    if (!base) return;
+
+    // Kill report sink (8 scanners feed into it)
+    patchAt(base, kANORT_sub_60D86, kThumb_RET_ZERO, 4);
+
+    // Kill report builder + upload (sub_B6CDC → formats + submits gamesafe URL)
+    patchAt(base, kANORT_sub_B6CDC, kThumb_RET_ZERO, 4);
+
+    // Kill detection aggregator (dispatched via fn-ptr table, runs file scanner)
+    patchAt(base, kANORT_sub_58970, kThumb_BX_LR, 2);
+
+    NSLog(@"[ANTIBAN] libanort bypass done");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Integrity re-check: verify kill-switch bytes are still in place
+//  (libanogs sub_E24BC rolling checksum VM may restore .bss in some builds)
+// ─────────────────────────────────────────────────────────────────────────────
+static uint64_t _baseAnogs = 0;
+static uint64_t _baseAnort = 0;
+
+static void reapplyIfNeeded(void) {
+    if (!_baseAnogs) _baseAnogs = getLibBase("libanogs");
+    if (!_baseAnort) _baseAnort = getLibBase("libanort");
+
+    if (_baseAnogs) {
+        uint8_t flagVal = 0xFF;
+        _read((long)(_baseAnogs + kANOGS_g_tdm_report_enabled), &flagVal, 1);
+        if (flagVal != 0x00) {
+            NSLog(@"[ANTIBAN] libanogs kill-switch restored — re-applying");
+            bypassLibanogs(_baseAnogs);
+        }
+    }
+    if (_baseAnort) {
+        uint8_t cur[4] = {0};
+        _read((long)(_baseAnort + kANORT_sub_60D86), cur, 4);
+        if (memcmp(cur, kThumb_RET_ZERO, 4) != 0) {
+            NSLog(@"[ANTIBAN] libanort patch restored — re-applying");
+            bypassLibanort(_baseAnort);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bundle IDs + container resolution
 // ─────────────────────────────────────────────────────────────────────────────
 static NSArray<NSString *> *supportedBundleIDs(void) {
     return @[ @"com.dts.freefireth", @"com.dts.freefiremax" ];
 }
 
 static NSArray<NSString *> *watchedRelDirs(void) {
-    return @[
-        @"Documents", @"Documents/contentcache",
-        @"Library/Caches", @"Library/Preferences", @"tmp"
-    ];
+    return @[ @"Documents", @"Library/Caches", @"Library/Preferences", @"tmp" ];
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Container resolution via metadata plist scan.
-// ─────────────────────────────────────────────────────────────────────────────
 static NSString * _Nullable resolveContainerPath(NSString *bundleID) {
     NSString *root = @"/var/mobile/Containers/Data/Application";
     for (NSString *uuid in [[NSFileManager defaultManager]
@@ -102,190 +211,72 @@ static NSString * _Nullable resolveContainerPath(NSString *bundleID) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  UnityFramework base
+//  File-level clean — libanort reads these files for cert/hash checks
+//  Also libanogs reads /proc/self/maps and certain cache paths
 // ─────────────────────────────────────────────────────────────────────────────
-static uint64_t getUnityBase(void) {
-    if (get_task == MACH_PORT_NULL) return 0;
-    mach_vm_address_t base = get_image_base_address(get_task, "UnityFramework");
-    if (!base) base = get_image_base_address(get_task, "FreeFire");
-    return (uint64_t)base;
-}
-
-static BOOL patchAt(uint64_t base, uint64_t rva,
-                    const uint8_t *bytes, size_t len) {
-    if (!base) return NO;
-    return _write((long)(base + rva), bytes, (int)len) ? YES : NO;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Full bypass — all real RVAs, complete coverage of every report/scan path.
-//
-//  Strategy per-function type:
-//    void functions       → RET        (just return, do nothing)
-//    int scan functions   → MOV X0,0; RET  (return 0 = "clean / no detection")
-//    bool check functions → MOV X0,1; RET  (return true = "OK")
-// ─────────────────────────────────────────────────────────────────────────────
-static void applyBypass(uint64_t base) {
-    if (!base) return;
-
-    // ── TIER 1: Kill the per-frame TSS tick (RunOneFrame) ────────────────────
-    // This is the heartbeat. Without it TSS never ticks again for the session.
-    patchAt(base, kRVA_MOFOEPHILGO,   kRET,      4);
-
-    // ── TIER 2: Kill all report senders ──────────────────────────────────────
-    // DHEHFAGCCDM sends ReportGGPInfo to server (ban report).
-    // GIFIAMDDLOC + DLIDMJONJKE upload raw anticheat data bytes.
-    patchAt(base, kRVA_DHEHFAGCCDM,   kRET,      4);
-    patchAt(base, kRVA_JGFDFDBKIGD,   kRET,      4);  // GGP init
-    patchAt(base, kRVA_GIFIAMDDLOC,   kRET,      4);
-    patchAt(base, kRVA_DLIDMJONJKE,   kRET,      4);
-    patchAt(base, kRVA_PCEAEHNPBGI,   kRET,      4);  // OnRecvMsgToTssClient
-    patchAt(base, kRVA_BMCKEEOEDGD,   kRET,      4);  // ffantihackSDKLogin
-
-    // ── TIER 3: Kill all scan functions (return 0 = nothing found) ───────────
-    patchAt(base, kRVA_HIAKKLNIKFM,   kRET_ZERO, 8);  // main scan
-    patchAt(base, kRVA_NLJNAOBBPEA,   kRET_ZERO, 8);  // file hash check
-    patchAt(base, kRVA_ODEAEBAMLMG,   kRET_ZERO, 8);
-    patchAt(base, kRVA_OFKFJCNPFKM,   kRET_ZERO, 8);
-    patchAt(base, kRVA_CLLPBEADOJO,   kRET_ZERO, 8);
-    patchAt(base, kRVA_MLKLMCODPNC,   kRET_ZERO, 8);
-    patchAt(base, kRVA_BGBNLKACBPM,   kRET_ZERO, 8);
-    patchAt(base, kRVA_DLNECOKKAHG,   kRET_ZERO, 8);
-    patchAt(base, kRVA_DFKOBIMKOLE,   kRET_ZERO, 8);
-    patchAt(base, kRVA_IMGFJOBDIND,   kRET_ZERO, 8);
-    patchAt(base, kRVA_FOHHABEAHFL,   kRET_ZERO, 8);
-    patchAt(base, kRVA_HKHAIHDKELH,   kRET_ZERO, 8);
-    patchAt(base, kRVA_EKBBBHNHLOG,   kRET_ZERO, 8);
-    patchAt(base, kRVA_FOJGMNJAJDK,   kRET_ZERO, 8);
-    patchAt(base, kRVA_INMEGIDKBPJ,   kRET_ZERO, 8);
-    patchAt(base, kRVA_KJHAINMDKGJ,   kRET_ZERO, 8);
-
-    // ── TIER 4: Kill report builders and upload ───────────────────────────────
-    patchAt(base, kRVA_MGKBGGIMJFD_S, kRET_ZERO, 8);
-    patchAt(base, kRVA_MGKBGGIMJFD_B, kRET_ZERO, 8);
-    patchAt(base, kRVA_LOPJGIPCBLJ,   kRET_ZERO, 8);
-    patchAt(base, kRVA_IJABEHJEKHJ,   kRET_ZERO, 8);
-    patchAt(base, kRVA_CFHPLJBNANC,   kRET_ZERO, 8);
-
-    // ── TIER 5: Block re-init and payload builder ─────────────────────────────
-    patchAt(base, kRVA_JAMOJCJLJNG,   kRET,      4);
-    patchAt(base, kRVA_INICGCCOGEC,   kRET,      4);
-    patchAt(base, kRVA_JHACIFHANIL,   kRET,      4);
-    patchAt(base, kRVA_EHKHDPMNLIL,   kRET,      4);  // GetLiteData = empty
-
-    NSLog(@"[ANTIBAN] bypass applied — 30 RVAs patched @ 0x%llx", base);
-}
-
-static uint64_t _cachedBase = 0;
-
-// Re-apply if TSS self-healed (reads RunOneFrame first 4 bytes)
-static void reapplyIfNeeded(void) {
-    if (!_cachedBase) _cachedBase = getUnityBase();
-    if (!_cachedBase) return;
-    uint8_t cur[4] = {0};
-    _read((long)(_cachedBase + kRVA_MOFOEPHILGO), cur, 4);
-    if (memcmp(cur, kRET, 4) != 0) {
-        NSLog(@"[ANTIBAN] TSS self-healed — re-patching");
-        applyBypass(_cachedBase);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  File-level clean — remove telemetry/report files as fast as they appear.
-//  NO localConfig.json or Assembly-CSharp-patch.bytes writes — that's not our method.
-// ─────────────────────────────────────────────────────────────────────────────
-static NSArray<NSString *> *telemetryRelPaths(NSString *bundleID) {
-    return @[
-        // Crash reporters
-        @"Library/Caches/Analytics",       @"Library/Caches/CrashReporter",
-        @"Library/Caches/com.crashlytics.data", @"Library/Caches/crashes",
-        @"Library/Caches/bugly",           @"Library/Caches/Firebase",
-        @"Library/Caches/Crashlytics",     @"Library/Caches/GCloud",
-        @"Library/Caches/GVoice",
-        // Advertising / tracking
-        @"Library/Caches/com.google.firebase", @"Library/Caches/com.appsflyer",
-        @"Library/Caches/adjust-sdk",      @"Library/Caches/Snapshots",
-        // DB caches
-        @"Library/Caches/Cache.db",        @"Library/Caches/Cache.db-shm",
-        @"Library/Caches/Cache.db-wal",    @"Library/Caches/fsCachedData",
-        [NSString stringWithFormat:@"Library/Caches/%@/Cache.db",     bundleID],
-        [NSString stringWithFormat:@"Library/Caches/%@/Cache.db-shm", bundleID],
-        [NSString stringWithFormat:@"Library/Caches/%@/Cache.db-wal", bundleID],
-        [NSString stringWithFormat:@"Library/Caches/%@/fsCachedData", bundleID],
-        // Tencent SDK prefs
-        @"Library/Preferences/com.tencent.bugly",
-        // FF specific logs
-        @"Documents/ffrtc_log.txt",        @"Documents/ff_magicvoice_log.txt",
-        @"Documents/ff_magicvoice_engine_log.txt",
-        @"Documents/BackendJsonLog",       @"Documents/report",
-        @"Documents/analytics",            @"Documents/crash_dump",
-        @"Documents/beacon",               @"Documents/feedback",
-        @"Documents/GCloud",               @"Documents/MidasLog",
-        @"Documents/shadow_tracker",       @"Documents/tencent_tdid",
-        @"Documents/anti_cheat_logs",      @"Documents/vng_log",
-        @"Documents/msdk_log",             @"Documents/garena_log",
-        @"Documents/gvoice",               @"Documents/dp_log",
-        @"Documents/oss_log",              @"Documents/upload",
-        @"Documents/pending_reports",
-        // File integrity databases — TSS reads these for MD5_FILE_EXCEPTION check
-        @"Documents/contentcache/res_version.hash",
-        @"Documents/contentcache/file_hash.bin",
-        @"Documents/contentcache/verify_cache.dat",
-        @"Documents/contentcache/crc_cache.bin",
-        @"Documents/contentcache/asset_verify.db",
-        @"Documents/contentcache/patch_verify.dat",
-        @"Documents/contentcache/resource_manifest.json",
-        @"Documents/contentcache/checksum.bin",
-        @"Documents/contentcache/integrity_db.sqlite",
-        // tmp
-        @"tmp/Analytics",  @"tmp/CrashReporter",
-        @"tmp/crashes",    @"tmp/bugly",    @"tmp/appsflyer-v1",
-    ];
-}
-
 static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID) {
     NSFileManager *fm = [NSFileManager defaultManager];
     AntibanResult r   = {0, 0};
     NSURL *base = [NSURL fileURLWithPath:containerPath isDirectory:YES];
 
-    // 1. Static telemetry path wipe
-    for (NSString *rel in telemetryRelPaths(bundleID)) {
+    // Static telemetry paths (from proxyapp analysis + PROVEN_DETECTION.md)
+    NSArray<NSString *> *paths = @[
+        @"Library/Caches/Analytics",       @"Library/Caches/CrashReporter",
+        @"Library/Caches/com.crashlytics.data", @"Library/Caches/crashes",
+        @"Library/Caches/bugly",           @"Library/Caches/Firebase",
+        @"Library/Caches/Crashlytics",     @"Library/Caches/GCloud",
+        @"Library/Caches/GVoice",          @"Library/Caches/com.google.firebase",
+        @"Library/Caches/com.appsflyer",   @"Library/Caches/adjust-sdk",
+        @"Library/Caches/Snapshots",       @"Library/Caches/Cache.db",
+        @"Library/Caches/Cache.db-shm",    @"Library/Caches/Cache.db-wal",
+        @"Library/Caches/fsCachedData",
+        [NSString stringWithFormat:@"Library/Caches/%@/Cache.db",     bundleID],
+        [NSString stringWithFormat:@"Library/Caches/%@/Cache.db-shm", bundleID],
+        [NSString stringWithFormat:@"Library/Caches/%@/Cache.db-wal", bundleID],
+        @"Library/Preferences/com.tencent.bugly",
+        @"Documents/ffrtc_log.txt",        @"Documents/ff_magicvoice_log.txt",
+        @"Documents/BackendJsonLog",       @"Documents/report",
+        @"Documents/analytics",            @"Documents/crash_dump",
+        @"Documents/beacon",               @"Documents/GCloud",
+        @"Documents/MidasLog",             @"Documents/shadow_tracker",
+        @"Documents/tencent_tdid",         @"Documents/anti_cheat_logs",
+        @"Documents/vng_log",              @"Documents/upload",
+        @"Documents/pending_reports",
+        @"tmp/Analytics", @"tmp/CrashReporter", @"tmp/crashes", @"tmp/bugly",
+    ];
+
+    for (NSString *rel in paths) {
         NSURL *target = [base URLByAppendingPathComponent:rel];
         if (![fm fileExistsAtPath:target.path]) continue;
         NSError *err = nil;
         if ([fm removeItemAtURL:target error:&err]) {
             r.deletedCaches++;
         } else {
-            // Dir — wipe contents instead
             for (NSURL *sub in [fm contentsOfDirectoryAtURL:target
-                                   includingPropertiesForKeys:nil
-                                                      options:0 error:nil])
+                                    includingPropertiesForKeys:nil options:0 error:nil])
                 if ([fm removeItemAtURL:sub error:nil]) r.deletedCaches++;
         }
     }
 
-    // 2. Documents — wipe ALL files (game writes telemetry/report files here)
+    // Wipe all files in Documents (game writes telemetry here constantly)
     NSURL *docsURL = [base URLByAppendingPathComponent:@"Documents" isDirectory:YES];
     for (NSURL *item in [fm contentsOfDirectoryAtURL:docsURL
                            includingPropertiesForKeys:@[NSURLIsDirectoryKey]
                                               options:0 error:nil]) {
         NSNumber *isDir = nil;
         [item getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
-        if (isDir.boolValue) continue;   // dirs handled above or by vnode watcher
+        if (isDir.boolValue) continue;
         if ([fm removeItemAtURL:item error:nil]) r.deletedDocs++;
     }
 
-    // 3. Dynamic keyword scan — Library/Caches
+    // Dynamic keyword scan on Library/Caches
     NSURL *cachesURL = [base URLByAppendingPathComponent:@"Library/Caches" isDirectory:YES];
-    NSArray<NSString *> *kws = @[
-        @"analytics", @"crash", @"bugly", @"firebase",
-        @"appsflyer", @"adjust", @"cache.db", @"fscacheddata",
-        @"gcloud", @"gvoice", @"midas", @"beacon", @"report"
-    ];
     for (NSURL *item in [fm contentsOfDirectoryAtURL:cachesURL
                             includingPropertiesForKeys:nil options:0 error:nil]) {
         NSString *lname = item.lastPathComponent.lowercaseString;
-        for (NSString *kw in kws)
+        for (NSString *kw in @[@"analytics",@"crash",@"bugly",@"firebase",
+                                @"appsflyer",@"adjust",@"cache.db",@"gcloud",
+                                @"gvoice",@"midas",@"beacon",@"report"])
             if ([lname containsString:kw]) {
                 if ([fm removeItemAtURL:item error:nil]) r.deletedCaches++;
                 break;
@@ -296,7 +287,8 @@ static AntibanResult cleanContainer(NSString *containerPath, NSString *bundleID)
 }
 
 static AntibanResult performClean(void) {
-    reapplyIfNeeded();  // integrity check every time
+    // Always re-check bypass integrity
+    reapplyIfNeeded();
 
     AntibanResult total = {0, 0};
     for (NSString *bid in supportedBundleIDs()) {
@@ -354,12 +346,14 @@ static AntibanResult performClean(void) {
     NSLog(@"[ANTIBAN] startWatching");
 
     dispatch_async(_queue, ^{
-        _cachedBase = getUnityBase();
-        if (_cachedBase) applyBypass(_cachedBase);
+        // Apply bypass immediately on game start
+        _baseAnogs = getLibBase("libanogs");
+        _baseAnort = getLibBase("libanort");
+        if (_baseAnogs) bypassLibanogs(_baseAnogs);
+        if (_baseAnort) bypassLibanort(_baseAnort);
         self.lastResult = performClean();
     });
 
-    // Set up vnode watchers — fire on any WRITE to watched dirs
     NSMutableArray<NSString *> *dirs = [NSMutableArray new];
     for (NSString *bid in supportedBundleIDs()) {
         NSString *container = resolveContainerPath(bid);
@@ -383,10 +377,8 @@ static AntibanResult performClean(void) {
             DISPATCH_VNODE_WRITE | DISPATCH_VNODE_ATTRIB, _queue);
 
         dispatch_source_set_event_handler(src, ^{
-            // File written → immediate clean + bypass integrity check
             self.lastResult = performClean();
         });
-
         int fdCopy = fd;
         dispatch_source_set_cancel_handler(src, ^{ close(fdCopy); });
         dispatch_resume(src);
@@ -411,7 +403,8 @@ static AntibanResult performClean(void) {
     }
     [_sourceRefs removeAllObjects];
     [_fds removeAllObjects];
-    _cachedBase = 0;
+    _baseAnogs = 0;
+    _baseAnort = 0;
 
     dispatch_async(_queue, ^{ self.lastResult = performClean(); });
     self.isWatching = NO;
