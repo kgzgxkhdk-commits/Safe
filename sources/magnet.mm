@@ -1,8 +1,30 @@
-// magnet.mm
-// Aim Magnet с удержанием цели.
+// magnet.mm — OB55 FIXED v2
+//
+// ROOT CAUSE (объясняет почему не работает НИ В КАКОМ режиме в OB55):
+//
+// WriteLocalRoot ранее: WriteAddr<Vector3>(TransformHierarchy* + 0x90, pos)
+//   — это хардкод offset 0x90 внутри TransformHierarchy.
+//   В OB54 это совпадало с реальной позицией потому что rootNode всегда
+//   имел index=0 и layout TransformHierarchy был одним.
+//
+// В OB55 Unity изменил internal layout TransformHierarchy:
+//   getPositionExt читает позицию как:
+//     matrix_list = *(TransformHierarchy* + 0x18)
+//     index       = *(inner + 0x40)            [kTransformIndex]
+//     pos         = matrix_list[index * 48]    [sizeof(TMatrix)=48]
+//
+//   Хардкод 0x90 более не совпадает с matrix_list[index].position
+//   в OB55 — отсюда запись уходит в неправильное место памяти
+//   и движок не видит сдвига.
+//
+// FIX: WriteLocalRoot теперь делает то же что getPositionExt, но в обратную сторону:
+//   читает index и matrix_list, пишет в matrix_list[index].position
+//   Зеркальный путь чтения из UnityMath.mm.
+
 #import "../esp/Core/GameLogic.h"
 #import "../esp/drawing_view/esp.h"
 #import "../esp/drawing_view/offset.h"
+#import "../esp/Core/UnityMath.h"
 #import "mahoa.h"
 #include <cmath>
 #include <atomic>
@@ -10,46 +32,88 @@
 #include <mutex>
 #include <thread>
 
-extern uint64_t g_SilentBestTarget;
 extern uint64_t cachedMatch;
 extern bool     aimMagnet;
-
-extern bool isAimIgnoreBot;
-extern bool isAimIgnoreKnock;
+extern bool     isAimIgnoreBot;
+extern bool     isAimIgnoreKnock;
 
 extern bool get_IsBot(uint64_t player);
 extern bool get_IsKnockedDown(uint64_t player);
 
-static constexpr float kMagStrength   = 1.00f;
-static constexpr float kMagMaxDist    = 500.0f;
-static constexpr float kMagMinDist    = 1.0f;
+static constexpr float    kMagStrength    = 1.00f;
+static constexpr float    kMagMaxDist     = 500.0f;
+static constexpr float    kMagMinDist     = 1.0f;
+static constexpr float    kMagDispCap     = 2.5f;   // работает везде вкл Custom Room
 
-static std::mutex        mag_lock;
-static std::atomic<bool> mag_hasData{false};
-static std::atomic<bool> mag_active{false};
-static std::atomic<bool> mag_started{false};
-
-static uint64_t mag_locked    = 0;
-static Vector3  mag_originalRoot = {};
-static bool     mag_originalRootValid = false;
-
-static Vector3  mag_camPos    = {};
-static Vector3  mag_camFwd    = {};
-static std::chrono::steady_clock::time_point mag_lastUpdate =
-    std::chrono::steady_clock::now();
-
-static inline uint64_t NowMs() {
-    using namespace std::chrono;
-    return (uint64_t)duration_cast<milliseconds>(
-        steady_clock::now().time_since_epoch()).count();
+// ─── helpers ────────────────────────────────────────────
+static inline float vlen3(Vector3 v){ return sqrtf(v.x*v.x+v.y*v.y+v.z*v.z); }
+static inline bool  isSane3(Vector3 v){
+    if(!isfinite(v.x)||!isfinite(v.y)||!isfinite(v.z)) return false;
+    if(fabsf(v.x)>20000.f||fabsf(v.y)>20000.f||fabsf(v.z)>20000.f) return false;
+    return !(v.x==0.f&&v.y==0.f&&v.z==0.f);
 }
 
-static inline float vlen3(Vector3 v) { return sqrtf(v.x*v.x + v.y*v.y + v.z*v.z); }
-static inline bool  isZero3(Vector3 v) { return v.x==0.f && v.y==0.f && v.z==0.f; }
-static inline bool  isSane3(Vector3 v) {
-    if (!isfinite(v.x) || !isfinite(v.y) || !isfinite(v.z)) return false;
-    if (fabsf(v.x) > 20000.f || fabsf(v.y) > 20000.f || fabsf(v.z) > 20000.f) return false;
+// ─── Matrix path (зеркало getPositionExt) ───────────────
+struct MagMatPath {
+    uint64_t matrix_list;   // TransformHierarchy* + 0x18
+    size_t   index;         // *(inner + 0x40)
+    bool     valid;
+};
+
+static MagMatPath ResolveMatPath(uint64_t nodePtr) {
+    if (!isVaildPtr(nodePtr)) return {};
+
+    // TransformNode.transform backing field @ 0x10
+    uint64_t managedTransform = ReadAddr<uint64_t>(nodePtr + kTransformInner);
+    if (!isVaildPtr(managedTransform)) return {};
+
+    // managed Transform -> native ptr @ 0x10 (m_CachedPtr)
+    uint64_t inner = ReadAddr<uint64_t>(managedTransform + kTransformInner);
+    if (!isVaildPtr(inner)) return {};
+
+    // inner -> TransformHierarchy* @ 0x38
+    uint64_t matrix = ReadAddr<uint64_t>(inner + kTransformMatrix);
+    if (!isVaildPtr(matrix)) return {};
+
+    // index @ inner+0x40
+    uint64_t indexU = ReadAddr<uint64_t>(inner + kTransformIndex);
+    if (indexU > 8192) return {};
+
+    // list = TransformHierarchy* + 0x18
+    uint64_t matrix_list = ReadAddr<uint64_t>(matrix + kMatrixList);
+    if (!isVaildPtr(matrix_list)) return {};
+
+    return { matrix_list, (size_t)indexU, true };
+}
+
+// читаем только локальную позицию этого узла (matrix_list[index].position)
+static Vector3 ReadLocalPos(const MagMatPath& p) {
+    if (!p.valid) return {};
+    return ReadAddr<Vector3>(p.matrix_list + sizeof(TMatrix) * p.index);
+}
+
+// пишем в matrix_list[index].position — зеркальный путь к getPositionExt
+static bool WriteLocalPos(const MagMatPath& p, Vector3 pos) {
+    if (!p.valid || !isSane3(pos)) return false;
+    // TMatrix: Vector4 position (16 bytes) — пишем только xyz, w не трогаем
+    WriteAddr<float>(p.matrix_list + sizeof(TMatrix)*p.index + 0,  pos.x);
+    WriteAddr<float>(p.matrix_list + sizeof(TMatrix)*p.index + 4,  pos.y);
+    WriteAddr<float>(p.matrix_list + sizeof(TMatrix)*p.index + 8,  pos.z);
     return true;
+}
+
+// ─── Root node path ──────────────────────────────────────
+static MagMatPath RootMatPath(uint64_t pawn) {
+    if (!isVaildPtr(pawn)) return {};
+    uint64_t node = ReadAddr<uint64_t>(pawn + kMagRootNodeOffset);   // 0x6C8
+    return ResolveMatPath(node);
+}
+
+static Vector3 RootWorld(uint64_t pawn) {
+    if (!isVaildPtr(pawn)) return {};
+    uint64_t node = ReadAddr<uint64_t>(pawn + kMagRootNodeOffset);
+    if (!isVaildPtr(node)) return {};
+    return getPositionExt(node);   // world position через полный traversal
 }
 
 static Vector3 HeadWorld(uint64_t pawn) {
@@ -58,119 +122,95 @@ static Vector3 HeadWorld(uint64_t pawn) {
     return isVaildPtr(t) ? getPositionExt(t) : Vector3{};
 }
 
-static Vector3 RootWorld(uint64_t pawn) {
-    if (!isVaildPtr(pawn)) return {};
-    uint64_t node = ReadAddr<uint64_t>(pawn + kMagRootNodeOffset);
-    if (!isVaildPtr(node)) return {};
-    uint64_t tf = ReadAddr<uint64_t>(node + kMagBodyPartOffset);
-    if (!isVaildPtr(tf)) return {};
-    return getPositionExt(tf);
-}
+// ─── shared state ────────────────────────────────────────
+static std::mutex        mag_lock;
+static std::atomic<bool> mag_hasData{false};
+static std::atomic<bool> mag_active{false};
+static std::atomic<bool> mag_started{false};
 
-static uint64_t MatPtr(uint64_t pawn) {
-    if (!isVaildPtr(pawn)) return 0;
-    uint64_t node = ReadAddr<uint64_t>(pawn + kMagRootNodeOffset);
-    if (!isVaildPtr(node)) return 0;
-    uint64_t tf = ReadAddr<uint64_t>(node + kMagBodyPartOffset);
-    if (!isVaildPtr(tf)) return 0;
-    uint64_t p3 = ReadAddr<uint64_t>(tf + kMagInnerOffset);
-    if (!isVaildPtr(p3)) return 0;
-    uint64_t mat = ReadAddr<uint64_t>(p3 + kMagMatrixOffset);
-    return isVaildPtr(mat) ? mat : 0;
-}
+static uint64_t  mag_locked  = 0;
+static Vector3   mag_origin  = {};   // world pos при захвате цели
+static MagMatPath mag_path   = {};   // matrix path захваченной цели
+static bool      mag_pathOk  = false;
 
-static bool WriteLocalRoot(uint64_t pawn, Vector3 pos) {
-    if (!isSane3(pos)) return false;
-    uint64_t mat = MatPtr(pawn);
-    if (!isVaildPtr(mat)) return false;
-    WriteAddr<Vector3>(mat + kMagPositionOffset, pos);
+static Vector3   mag_camPos  = {};
+static Vector3   mag_camFwd  = {};
+static std::chrono::steady_clock::time_point mag_lastUpdate =
+    std::chrono::steady_clock::now();
+
+static inline bool TargetValid(uint64_t p) {
+    if (!isVaildPtr(p)) return false;
+    if (get_CurHP(p) <= 0) return false;
+    if (isAimIgnoreBot   && get_IsBot(p))         return false;
+    if (isAimIgnoreKnock && get_IsKnockedDown(p)) return false;
     return true;
 }
 
-static bool TargetStillValid(uint64_t pawn) {
-    if (!isVaildPtr(pawn)) return false;
-    if (get_CurHP(pawn) <= 0) return false;
-    if (isAimIgnoreBot   && get_IsBot(pawn))         return false;
-    if (isAimIgnoreKnock && get_IsKnockedDown(pawn)) return false;
-    return true;
-}
-
-static bool ApplyMagnet(uint64_t pawn, const Vector3& camPos, const Vector3& camFwd) {
-    if (!TargetStillValid(pawn)) return false;
+// ─── Apply ───────────────────────────────────────────────
+static bool ApplyMagnet(const MagMatPath& path,
+                        const Vector3& origin,
+                        const Vector3& camPos,
+                        const Vector3& camFwd,
+                        uint64_t pawn) {
+    if (!path.valid) return false;
 
     Vector3 headW = HeadWorld(pawn);
-    if (!isSane3(headW) || isZero3(headW)) return false;
+    if (!isSane3(headW)) return false;
 
-    float dist = vlen3({headW.x - camPos.x, headW.y - camPos.y, headW.z - camPos.z});
+    float dist = vlen3({headW.x-camPos.x, headW.y-camPos.y, headW.z-camPos.z});
     if (dist < kMagMinDist || dist > kMagMaxDist) return false;
 
-    Vector3 curRootW = RootWorld(pawn);
-    if (!isSane3(curRootW) || isZero3(curRootW)) return false;
+    // читаем текущую локальную позицию узла
+    Vector3 curLocal = ReadLocalPos(path);
+    if (!isSane3(curLocal)) return false;
 
-    if (!mag_originalRootValid) return false;
-
-    Vector3 targetPt = {
+    // target = точка на луче камеры на дистанции цели
+    Vector3 targetWorld = {
         camPos.x + camFwd.x * dist,
-        camPos.y + camFwd.y * dist,
+        origin.y + kMagVerticalLiftValue,
         camPos.z + camFwd.z * dist
     };
 
-    float upwardLift = fmaxf(0.0f, kMagVerticalLiftValue);
-
-    float targetY = mag_originalRoot.y + upwardLift;
-
-    Vector3 rootTgtWorld = {
-        targetPt.x,
-        targetY,
-        targetPt.z
-    };
-
-    Vector3 lerped = {
-        curRootW.x + (rootTgtWorld.x - curRootW.x) * kMagStrength,
-        targetY,
-        curRootW.z + (rootTgtWorld.z - curRootW.z) * kMagStrength
-    };
-
-    // ── Ограничение X/Z от якоря (Y уже клампнут выше) ────────
-    Vector3 deltaOrig = {
-        lerped.x - mag_originalRoot.x,
-        0.f,
-        lerped.z - mag_originalRoot.z
-    };
-    float dOrig = sqrtf(deltaOrig.x*deltaOrig.x + deltaOrig.z*deltaOrig.z);
-    if (dOrig > kMagMaxDisplacementValue && dOrig > 0.0001f) {
-        float s = kMagMaxDisplacementValue / dOrig;
-        lerped.x = mag_originalRoot.x + deltaOrig.x * s;
-        lerped.z = mag_originalRoot.z + deltaOrig.z * s;
+    // displacement cap от оригинальной позиции (world space)
+    Vector3 deltaOrig = { targetWorld.x-origin.x, 0.f, targetWorld.z-origin.z };
+    float d = sqrtf(deltaOrig.x*deltaOrig.x + deltaOrig.z*deltaOrig.z);
+    if (d > kMagDispCap && d > 1e-4f) {
+        float s = kMagDispCap / d;
+        targetWorld.x = origin.x + deltaOrig.x*s;
+        targetWorld.z = origin.z + deltaOrig.z*s;
     }
 
-    return WriteLocalRoot(pawn, lerped);
+    // lerp
+    Vector3 newLocal = {
+        curLocal.x + (targetWorld.x - headW.x + curLocal.x - curLocal.x)*kMagStrength,
+        curLocal.y,
+        curLocal.z + (targetWorld.z - headW.z + curLocal.z - curLocal.z)*kMagStrength
+    };
+    // упрощённо: сдвигаем local на дельту world
+    float dx = (targetWorld.x - headW.x) * kMagStrength;
+    float dz = (targetWorld.z - headW.z) * kMagStrength;
+    newLocal = { curLocal.x + dx, curLocal.y, curLocal.z + dz };
+
+    return WriteLocalPos(path, newLocal);
 }
 
+// ─── Worker ──────────────────────────────────────────────
 static void MagnetWorker() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kMagTickMilliseconds));
-
         if (!mag_active.load(std::memory_order_acquire)) continue;
 
         std::lock_guard<std::mutex> lk(mag_lock);
         if (!mag_hasData.load(std::memory_order_acquire)) continue;
 
-        auto now = std::chrono::steady_clock::now();
         auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now - mag_lastUpdate).count();
+            std::chrono::steady_clock::now() - mag_lastUpdate).count();
         if (since > kMagReleaseMilliseconds) {
             mag_hasData.store(false, std::memory_order_release);
             continue;
         }
-
-        uint64_t target = mag_locked;
-        Vector3 camPos = mag_camPos;
-        Vector3 camFwd = mag_camFwd;
-        if (!isVaildPtr(target)) continue;
-        if (!TargetStillValid(target)) continue;
-
-        ApplyMagnet(target, camPos, camFwd);
+        if (!isVaildPtr(mag_locked) || !TargetValid(mag_locked) || !mag_pathOk) continue;
+        ApplyMagnet(mag_path, mag_origin, mag_camPos, mag_camFwd, mag_locked);
     }
 }
 
@@ -180,73 +220,48 @@ void InitMagnetThread() {
         std::thread(MagnetWorker).detach();
 }
 
-// enabled = true  → ADS, тянем.
-// enabled = false → не ADS, лок держим коротко.
 void RunAimMagnet(uint64_t target, Vector3 camPos, Vector3 camForward, bool enabled) {
     InitMagnetThread();
 
-    if (!aimMagnet) {
+    if (!aimMagnet || !enabled) {
         std::lock_guard<std::mutex> lk(mag_lock);
         mag_hasData.store(false, std::memory_order_release);
         mag_active.store(false,  std::memory_order_release);
-        mag_locked = 0;
-        mag_originalRoot = {};
-        mag_originalRootValid = false;
+        mag_locked = 0; mag_pathOk = false;
         return;
     }
-
-    static uint64_t s_unscopeSinceMs = 0;
-    static constexpr uint64_t kMagLockDropMs = 400;
 
     std::lock_guard<std::mutex> lk(mag_lock);
 
-    if (isVaildPtr(mag_locked) && !TargetStillValid(mag_locked)) {
-        mag_locked = 0;
-        mag_originalRootValid = false;
+    // дроп если цель умерла
+    if (isVaildPtr(mag_locked) && !TargetValid(mag_locked)) {
+        mag_locked = 0; mag_pathOk = false;
     }
 
-    if (!enabled) {
-        uint64_t nowMs = NowMs();
-        if (s_unscopeSinceMs == 0) s_unscopeSinceMs = nowMs;
-
-        mag_originalRootValid = false;
-        mag_active.store(false, std::memory_order_release);
-        mag_hasData.store(false, std::memory_order_release);
-
-        if (nowMs - s_unscopeSinceMs >= kMagLockDropMs) {
-            mag_locked = 0;
-            mag_originalRoot = {};
-            mag_originalRootValid = false;
-            s_unscopeSinceMs = 0;
-        }
-        return;
-    }
-
-    s_unscopeSinceMs = 0;
-
-    if (!isVaildPtr(mag_locked) && isVaildPtr(target) && TargetStillValid(target)) {
-        if (!isVaildPtr(cachedMatch)) {
-            mag_active.store(false, std::memory_order_release);
-            mag_hasData.store(false, std::memory_order_release);
-            return;
-        }
+    // захват новой цели
+    if (!isVaildPtr(mag_locked) && isVaildPtr(target) && TargetValid(target)) {
+        if (!isVaildPtr(cachedMatch)) { mag_active.store(false, std::memory_order_release); return; }
         Vector3 root = RootWorld(target);
-        if (isSane3(root) && !isZero3(root)) {
-            mag_locked = target;
-            mag_originalRoot = root;
-            mag_originalRootValid = true;
+        MagMatPath path = RootMatPath(target);
+        if (isSane3(root) && path.valid) {
+            mag_locked  = target;
+            mag_origin  = root;
+            mag_path    = path;
+            mag_pathOk  = true;
         }
     }
 
-    if (isVaildPtr(mag_locked) && !mag_originalRootValid) {
-        Vector3 root = RootWorld(mag_locked);
-        if (isSane3(root) && !isZero3(root)) {
-            mag_originalRoot = root;
-            mag_originalRootValid = true;
+    // обновление path если цель та же но path ещё не захвачен
+    if (isVaildPtr(mag_locked) && !mag_pathOk) {
+        MagMatPath path = RootMatPath(mag_locked);
+        if (path.valid) {
+            mag_path   = path;
+            mag_pathOk = true;
+            mag_origin = RootWorld(mag_locked);
         }
     }
 
-    if (!isVaildPtr(mag_locked) || !mag_originalRootValid) {
+    if (!isVaildPtr(mag_locked) || !mag_pathOk) {
         mag_active.store(false, std::memory_order_release);
         mag_hasData.store(false, std::memory_order_release);
         return;
@@ -255,7 +270,7 @@ void RunAimMagnet(uint64_t target, Vector3 camPos, Vector3 camForward, bool enab
     mag_camPos     = camPos;
     mag_camFwd     = camForward;
     mag_lastUpdate = std::chrono::steady_clock::now();
-    mag_active.store(true, std::memory_order_release);
+    mag_active.store(true,  std::memory_order_release);
     mag_hasData.store(true, std::memory_order_release);
 }
 
@@ -268,9 +283,6 @@ void ResetAimMagnet() {
     std::lock_guard<std::mutex> lk(mag_lock);
     mag_hasData.store(false, std::memory_order_release);
     mag_active.store(false,  std::memory_order_release);
-    mag_locked = 0;
-    mag_camPos = {};
-    mag_camFwd = {};
-    mag_originalRoot = {};
-    mag_originalRootValid = false;
+    mag_locked = 0; mag_camPos={}; mag_camFwd={};
+    mag_origin={}; mag_path={}; mag_pathOk=false;
 }
