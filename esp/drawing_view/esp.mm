@@ -871,6 +871,8 @@ static void AppendUMASkeleton(ESPGeometryBuffers *buffers, uint64_t pawn, float 
 
     // ── Silent Aim ──────────────────────────────────────────
     if (aimsilent1)
+        // [FIX-2] OB55 PGAIFNOGDAN dot-check — передаём forward камеры
+        SilentUpdateCamFwd(camFwd);
         RunSilentAim(bestTarget, myPawn, aimPosition, get_IsFiring(myPawn));
     else
         ResetSilentAim();
