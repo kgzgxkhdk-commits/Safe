@@ -150,3 +150,17 @@
 #define kColliderHeightOffset        0x84 // Native CapsuleCollider: height
 #define kColliderBoostRadiusValue     7.00f // Magnet collider tuning
 #define kColliderBoostHeightValue    14.00f // Magnet collider tuning
+// ════════════════════════════════════════════════════
+// OB55 additions — добавить в конец offset.h
+// ════════════════════════════════════════════════════
+
+// [FIX-1] OB55 new AimInfo slots in Player
+// Player::AEJHONDBJAD @ 0xB10 — new CGKJLKPMGDJ (new recoil weapon type)
+// Player::IACGJCEFEBD @ 0xB20 — second new CGKJLKPMGDJ
+#define kLastAimInfo_B10        0xB10
+#define kLastAimInfo_B20        0xB20
+
+// [FIX-2] PGAIFNOGDAN FollowCamera dot-check (NEW in OB55)
+// dot(RayDirection, cameraForward) must be >= 0, else hit = fake
+// used in CorrectDirForCam() in silent.mm
+#define kSilentMinDirDotThreshold  0.0f
