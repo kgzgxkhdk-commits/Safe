@@ -1,6 +1,6 @@
 #pragma once
 
-#define kGameFacadeTypeInfo      0xBB46A50 // GameFacade_TypeInfo; OB55 dump/user-provided RVA
+#define kGameFacadeTypeInfo      0xB7A24F0 // GameFacade_TypeInfo; OB55 dump/user-provided RVA
 
 // ─── Player / match / camera offsets ─────────────────────────────────────
 #define kTypeInfoStatics         0xB8    // GameFacade.TypeInfo: static fields pointer
